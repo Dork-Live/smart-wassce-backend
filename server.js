@@ -452,7 +452,40 @@ app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), asy
     return res.status(500).send("error");
   }
 });
+/**
+ * GET /api/public/history
+ * Public route — lookup vouchers by phone ONLY
+ * Example: /api/public/history?phone=0241234567
+ */
+app.get("/api/public/history", async (req, res) => {
+  try {
+    const rawPhone = (req.query.phone || "").trim();
+    if (!rawPhone) {
+      return res.status(400).json({ success: false, error: "Missing phone number" });
+    }
 
+    const cleaned = rawPhone.replace(/\D/g, ""); // remove spaces, dashes
+    if (cleaned.length < 9) {
+      return res.json({ success: true, vouchers: [] });
+    }
+
+    const history = await History.find({}).lean();
+
+    const matches = history.filter(h => {
+      const phoneField = (h.usedBy || "").replace(/\D/g, "");
+      return phoneField.endsWith(cleaned);
+    });
+
+    const BASE = process.env.BASE_URL || "http://localhost:4000";
+
+    const vouchers = matches.map(h => `${BASE}/uploads/${h.filename}`);
+
+    res.json({ success: true, vouchers });
+  } catch (err) {
+    console.error("Public history error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
 // -------------------------
 // Start server
 // -------------------------
