@@ -476,7 +476,7 @@ app.get("/api/public/history", async (req, res) => {
       return phoneField.endsWith(cleaned);
     });
 
-    const BASE = process.env.BASE_URL || "http://localhost:4000";
+    const BASE = process.env.BASE_URL || "https://api.smartwassce.com";
 
     const vouchers = matches.map(h => `${BASE}/uploads/${h.filename}`);
 
