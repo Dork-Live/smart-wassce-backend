@@ -23,7 +23,7 @@ const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI || "";
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
-const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY; // use secret for signature check
+const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL || `${BASE_URL}/success.html`;
 const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 25);
@@ -79,7 +79,7 @@ const VoucherSchema = new mongoose.Schema({
   batchId: { type: String },
   uploadedAt: { type: Date, default: Date.now },
   usedAt: { type: Date },
-  reference: { type: String }, // paystack reference if used
+  reference: { type: String },
 });
 const Voucher = mongoose.model("Voucher", VoucherSchema);
 
@@ -103,13 +103,33 @@ app.use(bodyParser.json({ limit: "1mb" }));
 app.use(cookieParser());
 app.use("/uploads", express.static(UPLOADS_DIR));
 
+/*** ✅ NEW FALLBACK STATIC ROUTE ***/
+app.get("/api/uploads/:filename", async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    if (!filename) return res.status(400).send("Missing filename");
+
+    if (filename.includes("..") || filename.includes("/"))
+      return res.status(400).send("Invalid filename");
+
+    const filePath = path.join(UPLOADS_DIR, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).send("Not found");
+
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    return res.sendFile(filePath);
+  } catch (err) {
+    console.error("API uploads error:", err);
+    return res.status(500).send("Server error");
+  }
+});
+/*** END FALLBACK ROUTE ***/
+
 // -------------------------
-// Multer config for uploads
+// Multer config
 // -------------------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) => {
-    // Temporary unique name — we will rename to voucher_<seq>.ext
     const safe = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
     cb(null, safe);
   },
@@ -141,12 +161,14 @@ function requireAdmin(req, res, next) {
   const authHeader = req.headers.authorization || "";
   let token = null;
   if (authHeader.startsWith("Bearer ")) token = authHeader.split(" ")[1];
-  else if (req.cookies && req.cookies.admin_token) token = req.cookies.admin_token;
+  else if (req.cookies?.admin_token) token = req.cookies.admin_token;
   else if (req.headers["x-admin-token"]) token = req.headers["x-admin-token"];
 
   if (!token) return res.status(401).json({ success: false, error: "Unauthorized - no token" });
+
   const payload = verifyAdminToken(token);
   if (!payload) return res.status(401).json({ success: false, error: "Unauthorized - invalid token" });
+
   req.admin = payload;
   next();
 }
@@ -155,24 +177,30 @@ function requireAdmin(req, res, next) {
 // Helpers
 // -------------------------
 async function allocateUnused(qty, reference = null, phone = "unknown", email = null) {
-  // find N unused vouchers by cardId ascending
   const unused = await Voucher.find({ status: "unused" }).sort({ cardId: 1 }).limit(qty);
   if (unused.length < qty) return null;
 
   const ids = unused.map(u => u._id);
-  await Voucher.updateMany({ _id: { $in: ids } }, { $set: { status: "used", usedAt: new Date(), reference } });
+  await Voucher.updateMany(
+    { _id: { $in: ids } },
+    { $set: { status: "used", usedAt: new Date(), reference } }
+  );
 
   const hist = unused.map(u => ({
     cardId: u.cardId,
     filename: u.filename,
     usedBy: phone,
     usedByEmail: email || null,
-    reference: reference || null,
+    reference,
     dateUsed: new Date(),
   }));
   await History.insertMany(hist);
 
-  return unused.map(u => ({ id: u.cardId, filename: u.filename, url: `${BASE_URL}/uploads/${u.filename}` }));
+  return unused.map(u => ({
+    id: u.cardId,
+    filename: u.filename,
+    url: `${BASE_URL}/uploads/${u.filename}`
+  }));
 }
 
 // -------------------------
@@ -180,138 +208,145 @@ async function allocateUnused(qty, reference = null, phone = "unknown", email = 
 // -------------------------
 app.get("/", (req, res) => res.send("✅ Smart WASSCE backend (Mongo + webhook)"));
 
-/**
- * Admin login -> returns JWT token
- * Body: { email, password }
- */
+// -------------------------
+// ADMIN LOGIN
+// -------------------------
 app.post("/api/admin/login", (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ success: false, error: "Missing credentials" });
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+  if (!email || !password)
+    return res.status(400).json({ success: false, error: "Missing credentials" });
+
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD)
     return res.status(401).json({ success: false, error: "Invalid credentials" });
-  }
+
   const token = signAdminToken({ email });
   return res.json({ success: true, token, email });
 });
 
-app.post("/api/admin/logout", (req, res) => {
-  return res.json({ success: true });
-});
+app.post("/api/admin/logout", (req, res) => res.json({ success: true }));
 
-/**
- * Upload vouchers (admin) — rename to sequential voucher_<seq>.ext and save to DB
- */
+// -------------------------
+// UPLOAD
+// -------------------------
 app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 20), async (req, res) => {
   try {
-    if (!req.files || req.files.length === 0) return res.status(400).json({ success: false, error: "No files" });
+    if (!req.files?.length)
+      return res.status(400).json({ success: false, error: "No files" });
+
     const batchId = `batch-${Date.now()}`;
     const added = [];
+
     for (const file of req.files) {
       const seq = await getNextSequence("voucherSeq", 1);
       const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
       const newFilename = `voucher_${seq}${ext}`;
-      const oldPath = path.join(UPLOADS_DIR, file.filename);
-      const newPath = path.join(UPLOADS_DIR, newFilename);
-      fs.renameSync(oldPath, newPath);
+
+      fs.renameSync(path.join(UPLOADS_DIR, file.filename), path.join(UPLOADS_DIR, newFilename));
+
       const v = new Voucher({
         cardId: seq,
         filename: newFilename,
         status: "unused",
         batchId,
-        uploadedAt: new Date(),
       });
+
       await v.save();
       added.push({ id: seq, filename: newFilename, url: `${BASE_URL}/uploads/${newFilename}` });
     }
+
     return res.json({ success: true, added });
+
   } catch (err) {
     console.error("Upload error:", err);
     return res.status(500).json({ success: false, error: "Upload failed", details: err.message });
   }
 });
 
-/**
- * GET /api/vouchers/all (admin)
- */
+// -------------------------
+// GET ALL VOUCHERS
+// -------------------------
 app.get("/api/vouchers/all", requireAdmin, async (req, res) => {
   try {
     const vouchers = await Voucher.find({}).sort({ cardId: 1 }).lean();
     return res.json({ success: true, vouchers });
   } catch (err) {
-    console.error(err);
     return res.status(500).json({ success: false, error: "Failed to read vouchers" });
   }
 });
 
-/**
- * GET /api/history (admin)
- */
+// -------------------------
+// HISTORY
+// -------------------------
 app.get("/api/history", requireAdmin, async (req, res) => {
   try {
     const history = await History.find({}).sort({ dateUsed: -1 }).lean();
     return res.json({ success: true, history });
   } catch (err) {
-    console.error(err);
     return res.status(500).json({ success: false, error: "Failed to read history" });
   }
 });
 
-/**
- * DELETE /api/vouchers/used (admin)
- */
+// -------------------------
+// DELETE USED
+// -------------------------
 app.delete("/api/vouchers/used", requireAdmin, async (req, res) => {
   try {
     const used = await Voucher.find({ status: "used" }).lean();
-    if (!used.length) return res.json({ success: true, message: "No used vouchers" });
+    if (!used.length)
+      return res.json({ success: true, message: "No used vouchers" });
+
     for (const v of used) {
       const filePath = path.join(UPLOADS_DIR, v.filename);
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
+
     const result = await Voucher.deleteMany({ status: "used" });
     return res.json({ success: true, message: `Deleted ${result.deletedCount} used vouchers.` });
+
   } catch (err) {
-    console.error("Delete used error:", err);
-    return res.status(500).json({ success: false, error: "Failed to delete used vouchers", details: err.message });
+    return res.status(500).json({ success: false, error: "Failed to delete used vouchers" });
   }
 });
 
-/**
- * GET /api/find-by-reference/:ref
- * Returns voucher URLs previously allocated for this reference (idempotent)
- * This endpoint is used by success.html and retrieve.html to fetch vouchers without
- * contacting Paystack (so the frontend works regardless of Paystack callback).
- */
+// -------------------------
+// FIND BY REFERENCE
+// -------------------------
 app.get("/api/find-by-reference/:ref", async (req, res) => {
   try {
     const ref = req.params.ref;
     if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
-    const history = await History.find({ reference: ref }).lean();
-    if (!history.length) return res.json({ success: false, error: "No vouchers found for this reference" });
-    const urls = history.map(h => `${BASE_URL}/uploads/${h.filename}`);
-    return res.json({ success: true, vouchers: urls, message: "Found" });
+
+    const hist = await History.find({ reference: ref }).lean();
+    if (!hist.length)
+      return res.json({ success: false, error: "No vouchers found for this reference" });
+
+    const urls = hist.map(h => `${BASE_URL}/uploads/${h.filename}`);
+    return res.json({ success: true, vouchers: urls });
+
   } catch (err) {
-    console.error("find-by-reference error:", err);
     return res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
-/**
- * POST /api/pay
- * Initialize Paystack transaction (unchanged logic)
- * Body: { email, phone, quantity, amount }
- */
+// -------------------------
+// INITIATE PAY
+// -------------------------
 app.post("/api/pay", async (req, res) => {
   try {
     const { email, phone, quantity, amount } = req.body || {};
-    if (!email || !phone || !quantity || !amount) return res.status(400).json({ success: false, error: "Missing fields" });
+    if (!email || !phone || !quantity || !amount)
+      return res.status(400).json({ success: false, error: "Missing fields" });
 
     const expected = Number(quantity) * PRICE_PER_VOUCHER;
-    if (Number(amount) !== expected) return res.status(400).json({ success: false, error: `Amount mismatch. Expected ${expected}` });
+    if (Number(amount) !== expected)
+      return res.status(400).json({ success: false, error: `Amount mismatch. Expected ${expected}` });
 
     const unusedCount = await Voucher.countDocuments({ status: "unused" });
-    if (unusedCount < quantity) return res.status(400).json({ success: false, error: `Only ${unusedCount} voucher(s) available.` });
+    if (unusedCount < quantity)
+      return res.status(400).json({ success: false, error: `Only ${unusedCount} voucher(s) available.` });
 
-    if (!PAYSTACK_SECRET_KEY) return res.status(500).json({ success: false, error: "Paystack key not configured" });
+    if (!PAYSTACK_SECRET_KEY)
+      return res.status(500).json({ success: false, error: "Paystack key not configured" });
 
     const payload = {
       email,
@@ -321,171 +356,132 @@ app.post("/api/pay", async (req, res) => {
     };
 
     const response = await axios.post("https://api.paystack.co/transaction/initialize", payload, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" }
     });
 
     return res.json(response.data);
+
   } catch (err) {
-    console.error("Pay init error:", err.response?.data || err.message);
-    return res.status(500).json({ success: false, error: "Payment initialization failed", details: err.response?.data || err.message });
+    return res.status(500).json({ success: false, error: "Payment initialization failed" });
   }
 });
 
-/**
- * GET /api/verify/:reference
- * Backwards-compatible verify route (will still call Paystack verify) — not used by success.html anymore,
- * but kept for backward compatibility.
- */
+// -------------------------
+// VERIFY PAYMENT
+// -------------------------
 app.get("/api/verify/:reference", async (req, res) => {
   try {
     const ref = req.params.reference;
     if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
-    if (!PAYSTACK_SECRET_KEY) return res.status(500).json({ success: false, error: "Paystack key not configured" });
 
-    // If we already have history, return immediately
+    if (!PAYSTACK_SECRET_KEY)
+      return res.status(500).json({ success: false, error: "Paystack key not configured" });
+
     const existing = await History.find({ reference: ref }).lean();
-    if (existing.length > 0) {
+    if (existing.length) {
       const urls = existing.map(h => `${BASE_URL}/uploads/${h.filename}`);
-      return res.json({ success: true, vouchers: urls, message: "Already verified" });
+      return res.json({ success: true, vouchers: urls });
     }
 
-    // verify with Paystack
     const verifyResp = await axios.get(`https://api.paystack.co/transaction/verify/${encodeURIComponent(ref)}`, {
       headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
     });
+
     const payload = verifyResp.data;
-    if (!payload.status || payload.data.status !== "success") {
+    if (!payload.status || payload.data.status !== "success")
       return res.status(400).json({ success: false, error: "Payment not successful" });
-    }
 
     const metadata = payload.data.metadata || {};
     let quantity = parseInt(metadata.quantity, 10);
-    if (!quantity || isNaN(quantity)) quantity = Math.round(Number(payload.data.amount) / (PRICE_PER_VOUCHER * 100));
+    if (!quantity || isNaN(quantity))
+      quantity = Math.round(Number(payload.data.amount) / (PRICE_PER_VOUCHER * 100));
     if (quantity < 1) quantity = 1;
-    if (quantity > 100) quantity = 100;
 
-    const phone = metadata.phone || (payload.data.customer && payload.data.customer.phone) || "unknown";
+    const phone = metadata.phone || payload.data.customer?.phone || "unknown";
     const email = payload.data.customer?.email || null;
 
-    // allocate vouchers (atomic-ish)
     const assigned = await allocateUnused(quantity, ref, phone, email);
-    if (!assigned) {
+    if (!assigned)
       return res.status(400).json({ success: false, error: "Payment successful but not enough vouchers left." });
-    }
 
-    return res.json({ success: true, vouchers: assigned.map(a => a.url), assigned });
+    return res.json({ success: true, vouchers: assigned.map(a => a.url) });
+
   } catch (err) {
-    console.error("Verify error:", err.response?.data || err.message);
-    return res.status(500).json({ success: false, error: "Verification failed", details: err.response?.data || err.message });
+    return res.status(500).json({ success: false, error: "Verification failed" });
   }
 });
 
-/**
- * POST /api/paystack/webhook
- * Paystack will POST transaction events here (use in Paystack dashboard -> Webhooks)
- * We verify the X-Paystack-Signature header (HMAC SHA512).
- *
- * Behavior:
- *  - On successful payments: allocate vouchers using metadata.quantity (if not already allocated).
- *  - This route is idempotent: it will check history for reference and skip if already handled.
- */
+// -------------------------
+// PAYSTACK WEBHOOK
+// -------------------------
 app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    // Raw body is required to verify signature
-    const signature = req.headers["x-paystack-signature"] || req.headers["x-paystack-signature".toLowerCase()];
-    const raw = req.body; // Buffer
+    const signature = req.headers["x-paystack-signature"];
+    const computed = crypto.createHmac("sha512", PAYSTACK_WEBHOOK_SECRET).update(req.body).digest("hex");
 
-    // verify signature (HMAC SHA512 with your Paystack SECRET)
-    const computed = crypto.createHmac("sha512", PAYSTACK_WEBHOOK_SECRET).update(raw).digest("hex");
-    if (signature !== computed) {
-      console.warn("Webhook signature mismatch");
+    if (signature !== computed)
       return res.status(400).send("Invalid signature");
-    }
 
-    // parse JSON
-    const payload = JSON.parse(raw.toString("utf8"));
+    const payload = JSON.parse(req.body.toString("utf8"));
 
-    // Only handle transaction.success events
-    const event = payload.event || payload.type || "";
-    if (!event.toLowerCase().includes("transaction")) {
+    if (!payload.data || payload.data.status !== "success")
       return res.status(200).send("ignored");
-    }
 
-    const data = payload.data || payload;
-    if (!data || data.status !== "success") {
-      return res.status(200).send("ignored");
-    }
-
-    const ref = data.reference || data.trxref || data.id || null;
+    const data = payload.data;
+    const ref = data.reference;
     if (!ref) return res.status(400).send("no reference");
 
-    // If already processed (history exists for reference) -> idempotent
     const existing = await History.find({ reference: ref }).lean();
-    if (existing.length > 0) {
-      console.log(`Webhook: reference ${ref} already processed`);
-      return res.status(200).send("already-processed");
-    }
+    if (existing.length) return res.status(200).send("already-processed");
 
-    // determine quantity and metadata
     const metadata = data.metadata || {};
     let quantity = parseInt(metadata.quantity, 10);
-    if (!quantity || isNaN(quantity)) {
+    if (!quantity || isNaN(quantity))
       quantity = Math.round(Number(data.amount) / (PRICE_PER_VOUCHER * 100));
-    }
-    if (quantity < 1) quantity = 1;
-    if (quantity > 100) quantity = 100;
 
-    const phone = metadata.phone || (data.customer && data.customer.phone) || "unknown";
+    const phone = metadata.phone || data.customer?.phone || "unknown";
     const email = data.customer?.email || null;
 
     const allocated = await allocateUnused(quantity, ref, phone, email);
-    if (!allocated) {
-      // Payment OK but no vouchers left -> store a History record indicating failure (optional)
-      console.error(`Webhook: Payment success but insufficient vouchers for ref ${ref}`);
-      return res.status(200).send("insufficient-vouchers");
-    }
 
-    console.log(`Webhook: allocated ${allocated.length} vouchers for ref ${ref}`);
+    if (!allocated) return res.status(200).send("insufficient-vouchers");
+
     return res.status(200).send("ok");
+
   } catch (err) {
-    console.error("Webhook handler error:", err);
     return res.status(500).send("error");
   }
 });
-/**
- * GET /api/public/history
- * Public route — lookup vouchers by phone ONLY
- * Example: /api/public/history?phone=0241234567
- */
+
+// -------------------------
+// PUBLIC LOOKUP BY PHONE
+// -------------------------
 app.get("/api/public/history", async (req, res) => {
   try {
     const rawPhone = (req.query.phone || "").trim();
-    if (!rawPhone) {
+    if (!rawPhone)
       return res.status(400).json({ success: false, error: "Missing phone number" });
-    }
 
-    const cleaned = rawPhone.replace(/\D/g, ""); // remove spaces, dashes
-    if (cleaned.length < 9) {
+    const cleaned = rawPhone.replace(/\D/g, "");
+    if (cleaned.length < 9)
       return res.json({ success: true, vouchers: [] });
-    }
 
-    const history = await History.find({}).lean();
+    const hist = await History.find({}).lean();
 
-    const matches = history.filter(h => {
-      const phoneField = (h.usedBy || "").replace(/\D/g, "");
-      return phoneField.endsWith(cleaned);
+    const matches = hist.filter(h => {
+      const p = (h.usedBy || "").replace(/\D/g, "");
+      return p.endsWith(cleaned);
     });
 
-    const BASE = process.env.BASE_URL || "https://api.smartwassce.com";
-
-    const vouchers = matches.map(h => `${BASE}/uploads/${h.filename}`);
+    const vouchers = matches.map(h => `${BASE_URL}/uploads/${h.filename}`);
 
     res.json({ success: true, vouchers });
+
   } catch (err) {
-    console.error("Public history error:", err);
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
+
 // -------------------------
 // Start server
 // -------------------------
