@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart WASSCE — Admin</title>
+<style>
+/* keep your existing styles — slightly tweaked */
+body{font-family:Poppins, sans-serif;background:#f4f6f8;margin:0;padding:18px}
+.wrap{max-width:1100px;margin:18px auto}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+h2{color:#0078d4;margin:0}
+.card{background:#fff;padding:16px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.06);margin-bottom:12px}
+input,button{padding:10px;border-radius:6px;border:1px solid #ccc;font-size:14px}
+button{cursor:pointer;background:#0078d4;color:#fff;border:none}
+.grid{display:grid;grid-template-columns:1fr 380px;gap:12px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;font-size:13px}
+th{background:#0078d4;color:#fff}
+img{width:80px;border-radius:6px}
+footer{text-align:center;margin-top:14px;color:#666;font-size:13px}
+.small{font-size:13px;color:#666;margin-top:8px}
+.muted{color:#888;font-size:13px}
+pre{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h2>Smart WASSCE — Admin Panel</h2>
+    <div>
+      <span id="adminEmail" class="muted"></span>
+      <button id="logoutBtn" style="margin-left:12px;background:#dc3545">Logout</button>
+    </div>
+  </header>
+
+  <div id="loginCard" class="card">
+    <h3>Admin Login</h3>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="loginEmail" placeholder="Email" value="admin@gmail.com" style="flex:1" />
+      <input id="loginPassword" placeholder="Password" type="password" style="flex:1" />
+      <button id="loginBtn">Login</button>
+    </div>
+    <div class="small">Hidden admin URL: <b>smart-wassce-5435.html</b></div>
+  </div>
+
+  <div id="dashboard" style="display:none">
+    <div class="card small">
+      <strong>Quick Actions</strong>
+      <div style="margin-top:10px">
+        <input id="files" type="file" accept="image/*" multiple />
+        <button id="uploadBtn">Upload (max 20)</button>
+        <button id="deleteUsed" style="margin-left:8px;background:#d9534f">Delete Used Vouchers</button>
+        <button id="refreshAll" style="margin-left:8px" onclick="refreshAll()">Refresh</button>
+      </div>
+      <div id="out" class="small"></div>
+    </div>
+
+    <div class="grid">
+      <div>
+        <div class="card">
+          <h3>Voucher Inventory</h3>
+          <table id="voucherTable"><thead><tr><th>ID</th><th>Image</th><th>Status</th><th>Uploaded</th></tr></thead><tbody></tbody></table>
+        </div>
+
+        <div class="card" style="margin-top:12px">
+          <h3>Purchase / Voucher History</h3>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+            <input id="searchBox" placeholder="Search phone, email, reference" style="flex:1" />
+            <button id="exportExcel">Excel</button>
+            <button id="exportPDF" style="margin-left:6px">PDF</button>
+          </div>
+          <table id="historyTable"><thead><tr><th>Ref</th><th>Filename</th><th>Used By</th><th>Email</th><th>Date</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+
+      <div>
+        <div class="card"><h3>Admin Info</h3><div><strong id="statsTotal">—</strong></div><div class="small" id="statsText"></div></div>
+        <div class="card"><h3>Logs</h3><pre id="errorBox" style="height:260px;overflow:auto;background:#fafafa;border:1px solid #eee;padding:8px"></pre></div>
+      </div>
+    </div>
+
+    <footer>© 2025 Smart WASSCE — Admin</footer>
+  </div>
+</div>
+
+<!-- libs -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="admin.js"></script>
+</body>
+</html>

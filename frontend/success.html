@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Payment Success - Smart WASSCE</title>
+  <style>
+    /* keep your CSS unchanged where possible */
+    body{font-family:Poppins, sans-serif;padding:30px;text-align:center;background:linear-gradient(135deg,#b3e0ff,#70c9ff)}
+    .card{max-width:800px;margin:0 auto;background:#fff;padding:20px;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,.08)}
+    h2{color:#0078d4}
+    .vlist{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;margin-top:14px}
+    .vitem{width:160px;background:#f8f9fb;padding:8px;border-radius:10px}
+    .vitem img{width:100%;border-radius:8px}
+    .button{padding:10px 16px;border-radius:8px;border:none;background:#25d366;color:#fff;cursor:pointer}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>✅ Payment Successful</h2>
+    <p id="note">Verifying payment and preparing your voucher(s)...</p>
+    <div id="vlist" class="vlist"></div>
+    <button id="downloadAll" class="button" style="display:none;margin-top:12px">⬇️ Download All</button>
+  </div>
+
+<script>
+const BASE = "http://localhost:4000";
+
+async function forceDownload(url, filename){
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("Failed download");
+  const b = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+function showVouchers(vouchers){
+  const list = document.getElementById("vlist");
+  list.innerHTML = "";
+  vouchers.forEach((url, i) => {
+    const d = document.createElement("div"); d.className = "vitem";
+    d.innerHTML = `<img src="${url}" alt=""><div style="text-align:center;margin-top:8px"><button class="button" data-url="${url}" data-i="${i}">Download</button></div>`;
+    list.appendChild(d);
+  });
+
+  document.querySelectorAll(".vitem button").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      try {
+        await forceDownload(btn.dataset.url, `Voucher_${Number(btn.dataset.i)+1}.jpg`);
+      } catch(e) { alert("Download failed"); }
+    })
+  );
+
+  const dlAll = document.getElementById("downloadAll");
+  if (vouchers.length > 1) {
+    dlAll.style.display = "inline-block";
+    dlAll.onclick = async () => {
+      for (let i=0;i<vouchers.length;i++){
+        try { await forceDownload(vouchers[i], `Voucher_${i+1}.jpg`); } catch(e) {}
+        await new Promise(r=>setTimeout(r, 250));
+      }
+    };
+  } else dlAll.style.display = "none";
+
+  document.getElementById("note").textContent = `🎟️ You received ${vouchers.length} voucher(s). Download below.`;
+}
+
+(async function(){
+  const params = new URLSearchParams(location.search);
+  const ref = params.get("reference") || params.get("trxref");
+  const note = document.getElementById("note");
+  if (!ref) { note.textContent = "❌ No payment reference found."; return; }
+
+  // avoid re-allocations and speed up UX — cache by reference
+  const cached = localStorage.getItem("voucher_" + ref);
+  if (cached) {
+    showVouchers(JSON.parse(cached));
+    return;
+  }
+
+  try {
+    const r = await fetch(`${BASE}/api/verify/${encodeURIComponent(ref)}`);
+    const data = await r.json();
+    if (!data.success) { note.textContent = data.error || "Verification failed."; return; }
+    localStorage.setItem("voucher_" + ref, JSON.stringify(data.vouchers));
+    showVouchers(data.vouchers);
+  } catch (e) {
+    console.error(e);
+    note.textContent = "Server error verifying payment.";
+  }
+})();
+</script>
+</body>
+</html>

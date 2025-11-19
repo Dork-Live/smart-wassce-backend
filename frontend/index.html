@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SMART WASSCE - Buy Voucher</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Poppins, sans-serif;display:flex;align-items:center;flex-direction:column;padding:30px;background:linear-gradient(135deg,#b3e0ff,#70c9ff);min-height:100vh;}
+    .card{max-width:450px;width:100%;background:#fff;padding:25px 30px;border-radius:15px;box-shadow:0 10px 20px rgba(0,0,0,.12);}
+    h2{color:#007BFF;text-align:center;margin-bottom:12px;}
+    input,select,button{width:100%;padding:12px;margin:8px 0;border-radius:6px;border:1px solid #ccc;font-size:14px}
+    button{background:#007BFF;color:#fff;border:none;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .total{font-weight:bold;text-align:right;margin-top:6px}
+    #msg{color:red;margin-top:8px;text-align:center}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>SMART WASSCE — Buy Voucher</h2>
+    <label>Email</label>
+    <input id="email" type="email" placeholder="you@example.com" />
+    <label>Phone (10 digits)</label>
+    <input id="phone" type="tel" maxlength="10" placeholder="0241234567" />
+    <label>Network</label>
+    <select id="network"><option value="">Select</option><option>MTN</option><option>Telecel</option><option>AirtelTigo</option></select>
+    <label>Quantity (1-10)</label>
+    <input id="quantity" type="number" min="1" max="10" value="1" />
+    <div id="total" class="total">Total: ₵0.00</div>
+    <button id="proceed">Proceed to Payment</button>
+    <div id="msg"></div>
+  </div>
+
+<script>
+const BASE = "http://localhost:4000";
+const PRICE = 22.5;
+
+const qty = document.getElementById('quantity');
+const total = document.getElementById('total');
+function updateTotal(){ const q = Math.max(1, Math.min(10, Number(qty.value||1))); qty.value=q; total.textContent = `Total: ₵${(q*PRICE).toFixed(2)}`; }
+qty.addEventListener('input', updateTotal);
+updateTotal();
+
+document.getElementById('proceed').addEventListener('click', async () => {
+  const email = document.getElementById('email').value.trim();
+  const phone = document.getElementById('phone').value.trim();
+  const quantity = Math.max(1, Math.min(10, Number(document.getElementById('quantity').value || 1)));
+  const amount = Number((quantity * PRICE).toFixed(2));
+
+  const msg = document.getElementById('msg'); msg.textContent = '';
+
+  if (!email || !phone || phone.length !== 10) { msg.textContent = 'Enter valid email and 10-digit phone.'; return; }
+
+  try {
+    const r = await fetch(`${BASE}/api/pay`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ email, phone, quantity, amount })
+    });
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = d.error || 'Payment init failed'; return; }
+    const url = d.data?.authorization_url || d.authorization_url;
+    if (url) window.location.href = url;
+    else msg.textContent = 'Failed to get payment URL.';
+  } catch (e) {
+    console.error(e);
+    msg.textContent = 'Server error, try later.';
+  }
+});
+</script>
+</body>
+</html>

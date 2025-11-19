@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Retrieve Purchased Vouchers</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:Poppins, sans-serif;padding:20px;background:linear-gradient(135deg,#b3e0ff,#70c9ff)}
+.card{max-width:600px;background:#fff;margin:40px auto;padding:20px;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,.08)}
+input{width:96%;padding:12px;border:1px solid #ccc;border-radius:8px;margin-bottom:12px}
+button{width:100%;padding:12px;border:none;border-radius:8px;background:#0078d4;color:#fff;cursor:pointer}
+.vlist{margin-top:20px}
+.vitem{margin-bottom:15px}
+.vitem img{width:100%;border-radius:8px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>📥 Retrieve Purchased Vouchers</h2>
+  <input id="ref" placeholder="Enter your Payment Reference">
+  <button id="btn">Retrieve</button>
+  <div id="result" class="vlist"></div>
+</div>
+<script>
+const BASE = "http://localhost:4000";
+document.getElementById('btn').onclick = async () => {
+  const ref = document.getElementById('ref').value.trim();
+  if (!ref) return alert('Enter reference');
+  const area = document.getElementById('result'); area.innerHTML = 'Loading...';
+  try {
+    const r = await fetch(`${BASE}/api/verify/${encodeURIComponent(ref)}`);
+    const d = await r.json();
+    if (!d.success) { area.innerHTML = `<p style="color:red">${d.error||'Not found'}</p>`; return; }
+    area.innerHTML = '';
+    d.vouchers.forEach((u,i) => {
+      const div = document.createElement('div'); div.className='vitem';
+      div.innerHTML = `<img src="${u}"><button onclick="download('${u}',${i})">Download</button>`;
+      area.appendChild(div);
+    });
+  } catch(e){ area.innerHTML = `<p style="color:red">Server error</p>`; console.error(e); }
+};
+
+async function download(url, index){
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return alert('Download failed');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `Voucher_${index+1}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  } catch(e){ alert('Download failed'); console.error(e); }
+}
+</script>
+</body>
+</html>
