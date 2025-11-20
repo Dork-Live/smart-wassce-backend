@@ -81,7 +81,7 @@ async function getNextSequence(name, inc = 1) {
 
 const VoucherSchema = new mongoose.Schema({
   cardId: { type: Number, required: true, unique: true },
-  filename: { type: String, required: true }, // the object key used in R2
+  filename: { type: String, required: true }, // object key used in R2
   r2url: { type: String },                     // public URL for direct access
   status: { type: String, enum: ["unused", "used", "archived"], default: "unused" },
   batchId: { type: String },
@@ -114,6 +114,27 @@ const s3 = new S3Client({
   forcePathStyle: false,
 });
 
+// helper to upload to R2 (PutObject)
+async function uploadToR2(buffer, key, contentType = "image/jpeg") {
+  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
+  const cmd = new PutObjectCommand({
+    Bucket: R2_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+    // You can set ACL or metadata here if needed.
+  });
+  await s3.send(cmd);
+  return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(key)}`;
+}
+
+// helper to delete from R2 (DeleteObject)
+async function deleteFromR2(key) {
+  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
+  const cmd = new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key });
+  await s3.send(cmd);
+}
+
 // -------------------------
 // Express app
 // -------------------------
@@ -123,7 +144,7 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json({ limit: "2mb" }));
 app.use(cookieParser());
 
-// NOTE: No local /uploads static serving — we're R2-only now
+// NOTE: No local /uploads static serving — we rely on R2 public URLs
 
 // -------------------------
 // Multer config (memory storage — upload straight from memory to R2)
@@ -171,26 +192,6 @@ function requireAdmin(req, res, next) {
 // -------------------------
 // Helpers
 // -------------------------
-async function uploadToR2(buffer, key, contentType = "image/jpeg") {
-  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
-  const cmd = new PutObjectCommand({
-    Bucket: R2_BUCKET,
-    Key: key,
-    Body: buffer,
-    ContentType: contentType,
-    // Note: R2 buckets can be configured public (or use signed URLs)
-  });
-  await s3.send(cmd);
-  // Construct public URL — rely on R2 public hostname
-  return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(key)}`;
-}
-
-async function deleteFromR2(key) {
-  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
-  const cmd = new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key });
-  await s3.send(cmd);
-}
-
 // allocateUnused now returns r2url from DB
 async function allocateUnused(qty, reference = null, phone = "unknown", email = null) {
   // find N unused vouchers by cardId ascending
@@ -311,34 +312,38 @@ app.get("/api/history", requireAdmin, async (req, res) => {
 });
 
 /**
- * DELETE /api/vouchers/used (admin)
- * Removes used voucher records and deletes the objects from R2.
- * We mark DB records 'archived' or delete them depending on your choice — here we delete DB docs for used vouchers.
+ * DELETE /api/voucher/:id  (admin)
+ * - deletes the object from R2 (if present)
+ * - deletes the Voucher document
+ * - DOES NOT delete History (you chose B)
  */
-app.delete("/api/vouchers/used", requireAdmin, async (req, res) => {
+app.delete("/api/voucher/:id", requireAdmin, async (req, res) => {
   try {
-    const used = await Voucher.find({ status: "used" }).lean();
-    if (!used.length) return res.json({ success: true, message: "No used vouchers" });
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, error: "Missing id" });
 
-    let deletedCount = 0;
-    for (const v of used) {
+    // look up by cardId or Mongo _id (allow both)
+    let voucher = await Voucher.findOne({ cardId: Number(id) }).lean();
+    if (!voucher) voucher = await Voucher.findById(id).lean();
+    if (!voucher) return res.status(404).json({ success: false, error: "Voucher not found" });
+
+    // attempt delete from R2 if filename present
+    if (voucher.filename) {
       try {
-        if (v.filename) {
-          await deleteFromR2(v.filename);
-        }
-        deletedCount++;
+        await deleteFromR2(voucher.filename);
       } catch (e) {
-        console.warn("Failed to delete from R2 for", v.filename, e.message);
+        console.warn("R2 delete failed or object not found:", e.message || e);
+        // continue — we'll still remove the DB doc to keep admin view accurate
       }
     }
 
-    // remove used docs from DB
-    const result = await Voucher.deleteMany({ status: "used" });
-    // Optionally you may also delete corresponding History entries. Here we keep history.
-    return res.json({ success: true, message: `Deleted ${result.deletedCount} used vouchers (attempted R2 deletion of ${deletedCount}).` });
+    // delete voucher doc from DB
+    await Voucher.deleteOne({ _id: voucher._id });
+
+    return res.json({ success: true, message: "Voucher deleted (history preserved)." });
   } catch (err) {
-    console.error("Delete used error:", err);
-    return res.status(500).json({ success: false, error: "Failed to delete used vouchers", details: err.message });
+    console.error("Delete voucher error:", err);
+    return res.status(500).json({ success: false, error: "Failed to delete voucher", details: err.message });
   }
 });
 
@@ -352,11 +357,7 @@ app.get("/api/find-by-reference/:ref", async (req, res) => {
     if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
     const history = await History.find({ reference: ref }).lean();
     if (!history.length) return res.json({ success: false, error: "No vouchers found for this reference" });
-    const urls = history.map(h => {
-      // prefer r2url if voucher exists
-      if (h.filename) return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`;
-      return null;
-    }).filter(Boolean);
+    const urls = history.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
     return res.json({ success: true, vouchers: urls, message: "Found" });
   } catch (err) {
     console.error("find-by-reference error:", err);
@@ -535,4 +536,4 @@ app.get("/api/public/history", async (req, res) => {
 // -------------------------
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
-});
+});-
