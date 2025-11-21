@@ -453,7 +453,47 @@ app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), asy
     return res.status(500).send("error");
   }
 });
+// -------------------------------------------------------
+// SECURE DOWNLOAD PROXY (Fixes R2 CORS download issues)
+// -------------------------------------------------------
+import fetch from "node-fetch";  // <-- REQUIRED ON RENDER
 
+app.get("/api/download", async (req, res) => {
+  try {
+    const fileUrl = req.query.url;
+    if (!fileUrl) {
+      return res.status(400).send("Missing file URL");
+    }
+
+    console.log("Downloading:", fileUrl);
+
+    const encodedUrl = encodeURI(fileUrl);
+
+    const response = await fetch(encodedUrl);
+
+    if (!response.ok) {
+      console.error("R2 Fetch Error:", response.status);
+      return res.status(500).send("Failed to fetch file from R2");
+    }
+
+    // Extract filename from URL
+    const filename = fileUrl.split("/").pop() || "voucher.jpg";
+
+    // Pass through real content type
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
+    res.setHeader("Content-Type", contentType);
+
+    // Force browser download with correct filename
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    // Pipe file to client
+    response.body.pipe(res);
+
+  } catch (err) {
+    console.error("Download error:", err);
+    res.status(500).send("Server download error");
+  }
+});
 // -------------------------------------------------------
 // Public search by phone
 // GET /api/public/history?phone=...
@@ -482,6 +522,8 @@ app.get("/api/public/history", async (req, res) => {
 // -------------------------------------------------------
 // SECURE DOWNLOAD PROXY (Fixes R2 CORS download issues)
 // -------------------------------------------------------
+import fetch from "node-fetch";  // <-- REQUIRED ON RENDER
+
 app.get("/api/download", async (req, res) => {
   try {
     const fileUrl = req.query.url;
@@ -491,18 +533,26 @@ app.get("/api/download", async (req, res) => {
 
     console.log("Downloading:", fileUrl);
 
-    // Fetch the file from R2
-    const response = await fetch(fileUrl);
+    const encodedUrl = encodeURI(fileUrl);
+
+    const response = await fetch(encodedUrl);
 
     if (!response.ok) {
-      return res.status(500).send("Failed to fetch file");
+      console.error("R2 Fetch Error:", response.status);
+      return res.status(500).send("Failed to fetch file from R2");
     }
 
-    // Set headers to force download
-    res.setHeader("Content-Type", "image/jpeg");
-    res.setHeader("Content-Disposition", "attachment; filename=voucher.jpg");
+    // Extract filename from URL
+    const filename = fileUrl.split("/").pop() || "voucher.jpg";
 
-    // Stream to client
+    // Pass through real content type
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
+    res.setHeader("Content-Type", contentType);
+
+    // Force browser download with correct filename
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    // Pipe file to client
     response.body.pipe(res);
 
   } catch (err) {
