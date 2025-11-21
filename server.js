@@ -1,12 +1,11 @@
 // =======================================================
-// Smart WASSCE — Backend (MongoDB + Paystack + R2 Storage)
+// Smart WASSCE — Backend (MongoDB + Paystack + Cloudflare R2)
 // =======================================================
 
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import bodyParser from "body-parser";
-import path from "path";
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
 import axios from "axios";
@@ -15,24 +14,24 @@ import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
+import path from "path";
 
-// Load env
 dotenv.config();
 
-// dirname (ESM)
+// dirname for ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // -------------------------------------------------------
-// Environment Config
+// ENV CONFIG
 // -------------------------------------------------------
 const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
 
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL || `${BASE_URL}/success.html`;
+const BASE_URL = process.env.BASE_URL;
+const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL;
 
 const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 25);
 
@@ -40,36 +39,35 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 
-// ----------- R2 STORAGE SETTINGS -------------
+// Cloudflare R2
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET = process.env.R2_BUCKET;
+const R2_BUCKET = process.env.R2_BUCKET;  
 const R2_ENDPOINT = process.env.R2_ENDPOINT;
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
 
 if (!R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_ENDPOINT || !R2_PUBLIC_URL) {
-  console.error("❌ Missing R2 env variables!");
+  console.error("❌ Missing R2 env variables");
   process.exit(1);
 }
 
 // -------------------------------------------------------
-// MongoDB Connection
+// Mongoose Connect
 // -------------------------------------------------------
 async function connectDB() {
   try {
     await mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
-    console.log("✅ MongoDB connected");
+    console.log("✅ MongoDB Connected");
   } catch (err) {
-    console.error("❌ MongoDB connection error:", err);
+    console.error("❌ MongoDB Error:", err);
     process.exit(1);
   }
 }
 connectDB();
 
 // -------------------------------------------------------
-// Database Schemas
+// Schemas
 // -------------------------------------------------------
-
 const CounterSchema = new mongoose.Schema({ name: String, seq: Number });
 const Counter = mongoose.model("Counter", CounterSchema);
 
@@ -86,7 +84,7 @@ const VoucherSchema = new mongoose.Schema({
   cardId: Number,
   filename: String,
   r2url: String,
-  status: { type: String, default: "unused" },
+  status: { type: String, default: "unused" },  // unused | used
   batchId: String,
   uploadedAt: Date,
   usedAt: Date,
@@ -112,142 +110,131 @@ const r2 = new S3Client({
   endpoint: R2_ENDPOINT,
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID,
-    secretAccessKey: R2_SECRET_ACCESS_KEY,
+    secretAccessKey: R2_SECRET_ACCESS_KEY
   }
 });
 
-// -------------------------------------------------------
-// Express App Setup
-// -------------------------------------------------------
-const app = express();
-app.use(cors({ origin: true, credentials: true }));
-app.use(bodyParser.json({ limit: "5mb" }));
-app.use(cookieParser());
-
-// -------------------------------------------------------
-// Multer (memory storage for direct upload to R2)
-// -------------------------------------------------------
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }
-});
-
-// -------------------------------------------------------
-// Admin Authentication
-// -------------------------------------------------------
-
-function signAdminToken(payload = {}) {
-  return jwt.sign(payload, ADMIN_JWT_SECRET, { expiresIn: "12h" });
-}
-
-function verifyAdminToken(token) {
-  try { return jwt.verify(token, ADMIN_JWT_SECRET); }
-  catch { return null; }
-}
-
-function requireAdmin(req, res, next) {
-  const header = req.headers.authorization || "";
-  let token = null;
-
-  if (header.startsWith("Bearer ")) token = header.split(" ")[1];
-  else if (req.headers["x-admin-token"]) token = req.headers["x-admin-token"];
-  else if (req.cookies?.admin_token) token = req.cookies.admin_token;
-
-  if (!token) return res.status(401).json({ success: false, error: "Unauthorized" });
-
-  const valid = verifyAdminToken(token);
-  if (!valid) return res.status(401).json({ success: false, error: "Unauthorized" });
-
-  req.admin = valid;
-  next();
-}
-
-// -------------------------------------------------------
-// R2 STORAGE FUNCTIONS
-// -------------------------------------------------------
-
-async function uploadToR2(buffer, key, contentType = "image/jpeg") {
+// Upload helper
+async function uploadToR2(buffer, key, type) {
   await r2.send(new PutObjectCommand({
     Bucket: R2_BUCKET,
     Key: key,
     Body: buffer,
-    ContentType: contentType
+    ContentType: type
   }));
-  return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(key)}`;
+  return `${R2_PUBLIC_URL}/${encodeURIComponent(key)}`;
 }
 
+// Delete helper
 async function deleteFromR2(key) {
-  await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  await r2.send(new DeleteObjectCommand({
+    Bucket: R2_BUCKET,
+    Key: key
+  }));
 }
 
 // -------------------------------------------------------
-// UPLOAD VOUCHERS (ADMIN)
+// Express App
+// -------------------------------------------------------
+const app = express();
+app.use(cors({ origin: true, credentials: true }));
+app.use(bodyParser.json({ limit: "10mb" }));
+app.use(cookieParser());
+
+// Multer (Memory Upload)
+const upload = multer({ storage: multer.memoryStorage() });
+
+// -------------------------------------------------------
+// Admin Auth
+// -------------------------------------------------------
+function signAdminToken(payload = {}) {
+  return jwt.sign(payload, ADMIN_JWT_SECRET, { expiresIn: "12h" });
+}
+function verifyAdminToken(token) {
+  try { return jwt.verify(token, ADMIN_JWT_SECRET); }
+  catch { return null; }
+}
+function requireAdmin(req, res, next) {
+  const auth = req.headers.authorization || "";
+  let token = null;
+  if (auth.startsWith("Bearer ")) token = auth.split(" ")[1];
+  else if (req.headers["x-admin-token"]) token = req.headers["x-admin-token"];
+
+  if (!token) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+  const payload = verifyAdminToken(token);
+  if (!payload) return res.status(401).json({ success: false, error: "Unauthorized token" });
+
+  req.admin = payload;
+  next();
+}
+
+// -------------------------------------------------------
+// Upload Vouchers to R2
 // -------------------------------------------------------
 app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 50), async (req, res) => {
   try {
-    if (!req.files?.length)
-      return res.status(400).json({ success: false, error: "No files uploaded" });
-
-    const batchId = `batch-${Date.now()}`;
     const added = [];
 
     for (const file of req.files) {
       const seq = await getNextSequence("voucherSeq");
-      const ext = path.extname(file.originalname).toLowerCase();
-      const newFilename = `voucher_${seq}${ext}`;
-      const r2url = await uploadToR2(file.buffer, newFilename, file.mimetype);
+      const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
+      const key = `voucher_${seq}${ext}`;
 
-      await new Voucher({
+      const r2url = await uploadToR2(file.buffer, key, file.mimetype);
+
+      const voucher = new Voucher({
         cardId: seq,
-        filename: newFilename,
+        filename: key,
         r2url,
         status: "unused",
-        batchId,
+        batchId: `batch-${Date.now()}`,
         uploadedAt: new Date()
-      }).save();
+      });
 
-      added.push({ id: seq, filename: newFilename, url: r2url });
+      await voucher.save();
+      added.push({ id: seq, filename: key, url: r2url });
     }
 
-    res.json({ success: true, added });
+    return res.json({ success: true, added });
 
   } catch (err) {
-    console.error("UPLOAD ERROR:", err);
-    res.status(500).json({ success: false, error: "Upload failed" });
+    console.error("Upload error:", err);
+    return res.status(500).json({ success: false, error: "Upload failed" });
   }
 });
 
 // -------------------------------------------------------
-// DELETE SINGLE VOUCHER (ADMIN)
+// GET all vouchers
 // -------------------------------------------------------
-app.delete("/api/voucher/:id/delete", requireAdmin, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const v = await Voucher.findOne({ cardId: id }).lean();
-    if (!v) return res.status(404).json({ success: false, error: "Not found" });
+app.get("/api/vouchers/all", requireAdmin, async (req, res) => {
+  const vouchers = await Voucher.find({}).sort({ cardId: 1 }).lean();
+  return res.json({ success: true, vouchers });
+});
 
-    try { await deleteFromR2(v.filename); } catch {}
+// -------------------------------------------------------
+// DELETE ONE voucher by ID
+// -------------------------------------------------------
+app.post("/api/vouchers/delete-one", requireAdmin, async (req, res) => {
+  try {
+    const { id, filename } = req.body;
+
+    if (filename) {
+      await deleteFromR2(filename);
+    }
 
     await Voucher.deleteOne({ cardId: id });
 
-    res.json({ success: true, message: `Voucher ${id} deleted` });
+    return res.json({ success: true, message: `Voucher ${id} deleted` });
+
   } catch (err) {
-    console.error("DELETE ERROR:", err);
-    res.status(500).json({ success: false, error: "Failed to delete voucher" });
+    console.error("Delete-one error:", err);
+    return res.status(500).json({ success: false, error: "Delete failed" });
   }
 });
 
 // -------------------------------------------------------
-// GET ALL VOUCHERS (ADMIN)
-// -------------------------------------------------------
-app.get("/api/vouchers/all", requireAdmin, async (req, res) => {
-  const list = await Voucher.find({}).sort({ cardId: 1 }).lean();
-  list.forEach(v => v.r2url = `${R2_PUBLIC_URL}/${v.filename}`);
-  res.json({ success: true, vouchers: list });
-});
-
-// -------------------------------------------------------
-// GET HISTORY (ADMIN)
+// HISTORY
 // -------------------------------------------------------
 app.get("/api/history", requireAdmin, async (req, res) => {
   const hist = await History.find({}).sort({ dateUsed: -1 }).lean();
@@ -255,160 +242,142 @@ app.get("/api/history", requireAdmin, async (req, res) => {
 });
 
 // -------------------------------------------------------
-// Helper: allocate vouchers
+// Allocate Unused Vouchers
 // -------------------------------------------------------
 async function allocateUnused(qty, reference, phone, email) {
-  const unused = await Voucher.find({ status: "unused" })
-    .sort({ cardId: 1 })
-    .limit(qty);
+  const unused = await Voucher.find({ status: "unused" }).sort({ cardId: 1 }).limit(qty);
 
   if (unused.length < qty) return null;
 
-  const ids = unused.map(u => u._id);
-  await Voucher.updateMany({ _id: { $in: ids } }, { $set: { status: "used", usedAt: new Date(), reference } });
+  const ids = unused.map(v => v._id);
 
-  const hist = unused.map(u => ({
-    cardId: u.cardId,
-    filename: u.filename,
+  await Voucher.updateMany({ _id: { $in: ids } }, {
+    $set: { status: "used", usedAt: new Date(), reference }
+  });
+
+  await History.insertMany(unused.map(v => ({
+    cardId: v.cardId,
+    filename: v.filename,
     usedBy: phone,
     usedByEmail: email,
     reference,
     dateUsed: new Date()
-  }));
+  })));
 
-  await History.insertMany(hist);
-
-  return unused.map(u => `${R2_PUBLIC_URL}/${u.filename}`);
+  return unused.map(v => `${R2_PUBLIC_URL}/${encodeURIComponent(v.filename)}`);
 }
 
 // -------------------------------------------------------
 // PAYSTACK INIT
 // -------------------------------------------------------
 app.post("/api/pay", async (req, res) => {
-  try {
-    const { email, phone, quantity, amount } = req.body;
+  const { email, phone, quantity, amount } = req.body;
 
-    if (!email || !phone || !quantity || !amount)
-      return res.status(400).json({ success: false, error: "Missing fields" });
-
-    const expected = quantity * PRICE_PER_VOUCHER;
-    if (amount !== expected)
-      return res.status(400).json({ success: false, error: "Amount mismatch" });
-
-    const unused = await Voucher.countDocuments({ status: "unused" });
-    if (unused < quantity)
-      return res.json({ success: false, error: `Only ${unused} available` });
-
-    const payload = {
-      email,
-      amount: amount * 100,
-      metadata: { phone, quantity },
-      callback_url: FRONTEND_SUCCESS_URL
-    };
-
-    const r = await axios.post("https://api.paystack.co/transaction/initialize", payload, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
-    });
-
-    res.json(r.data);
-
-  } catch (err) {
-    console.error(err.response?.data || err);
-    res.status(500).json({ success: false, error: "Pay init failed" });
+  const expected = quantity * PRICE_PER_VOUCHER;
+  if (expected !== amount) {
+    return res.status(400).json({ success: false, error: "Amount mismatch" });
   }
+
+  const unusedCount = await Voucher.countDocuments({ status: "unused" });
+  if (unusedCount < quantity) {
+    return res.status(400).json({ success: false, error: "Not enough vouchers" });
+  }
+
+  const payload = {
+    email,
+    amount: amount * 100,
+    metadata: { phone, quantity },
+    callback_url: FRONTEND_SUCCESS_URL
+  };
+
+  const response = await axios.post(
+    "https://api.paystack.co/transaction/initialize",
+    payload,
+    { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
+  );
+
+  res.json(response.data);
 });
 
 // -------------------------------------------------------
-// VERIFY
+// PAYSTACK VERIFY
 // -------------------------------------------------------
 app.get("/api/verify/:reference", async (req, res) => {
-  try {
-    const ref = req.params.reference;
+  const ref = req.params.reference;
 
-    const existing = await History.find({ reference: ref }).lean();
-    if (existing.length > 0) {
-      return res.json({
-        success: true,
-        vouchers: existing.map(h => `${R2_PUBLIC_URL}/${h.filename}`),
-        message: "Already verified"
-      });
-    }
-
-    const r = await axios.get(`https://api.paystack.co/transaction/verify/${ref}`, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
-    });
-
-    const data = r.data.data;
-    if (data.status !== "success")
-      return res.status(400).json({ success: false, error: "Payment failed" });
-
-    const qty = Number(data.metadata?.quantity) || 1;
-
-    const phone = data.metadata?.phone || data.customer?.phone || "unknown";
-    const email = data.customer?.email || null;
-
-    const assigned = await allocateUnused(qty, ref, phone, email);
-
-    res.json({ success: true, vouchers: assigned });
-
-  } catch (err) {
-    console.error(err.response?.data || err);
-    res.status(500).json({ success: false, error: "Verify error" });
+  const existing = await History.find({ reference: ref });
+  if (existing.length) {
+    const urls = existing.map(h => `${R2_PUBLIC_URL}/${encodeURIComponent(h.filename)}`);
+    return res.json({ success: true, vouchers: urls });
   }
+
+  const verifyResp = await axios.get(
+    `https://api.paystack.co/transaction/verify/${ref}`,
+    { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
+  );
+
+  const data = verifyResp.data.data;
+  if (data.status !== "success") {
+    return res.status(400).json({ success: false, error: "Payment not successful" });
+  }
+
+  const qty = data.metadata.quantity;
+  const phone = data.metadata.phone;
+  const email = data.customer.email;
+
+  const assigned = await allocateUnused(qty, ref, phone, email);
+  if (!assigned) {
+    return res.status(400).json({ success: false, error: "Not enough vouchers" });
+  }
+
+  res.json({ success: true, vouchers: assigned });
 });
 
 // -------------------------------------------------------
-// PAYSTACK WEBHOOK
+// WEBHOOK
 // -------------------------------------------------------
-app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    const sig = req.headers["x-paystack-signature"];
-    const hash = crypto.createHmac("sha512", PAYSTACK_WEBHOOK_SECRET).update(req.body).digest("hex");
+app.post("/api/paystack/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
 
-    if (sig !== hash) return res.status(400).send("Invalid signature");
+    const signature = req.headers["x-paystack-signature"];
+    const computed = crypto.createHmac("sha512", PAYSTACK_WEBHOOK_SECRET)
+      .update(req.body)
+      .digest("hex");
+
+    if (signature !== computed) return res.status(400).send("Invalid signature");
 
     const payload = JSON.parse(req.body.toString());
     const data = payload.data;
 
-    if (data.status !== "success") return res.send("ignored");
+    if (data.status !== "success") return res.status(200).send("ignored");
 
     const ref = data.reference;
 
-    const existing = await History.find({ reference: ref }).lean();
-    if (existing.length) return res.send("already processed");
+    const existing = await History.find({ reference: ref });
+    if (existing.length) return res.status(200).send("already processed");
 
-    const qty = Number(data.metadata?.quantity) || 1;
-    const phone = data.metadata?.phone || data.customer?.phone || "unknown";
-    const email = data.customer?.email || null;
+    const qty = data.metadata.quantity;
+    const phone = data.metadata.phone;
+    const email = data.customer.email;
 
     await allocateUnused(qty, ref, phone, email);
 
-    res.send("ok");
-
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.status(500).send("error");
+    res.status(200).send("ok");
   }
-});
+);
 
 // -------------------------------------------------------
-// PUBLIC SEARCH BY PHONE
+// PUBLIC CHECK BY PHONE
 // -------------------------------------------------------
 app.get("/api/public/history", async (req, res) => {
-  const phoneRaw = req.query.phone;
-  if (!phoneRaw) return res.json({ success: false, vouchers: [] });
+  const phone = (req.query.phone || "").replace(/\D/g, "");
 
-  const cleaned = phoneRaw.replace(/\D/g, "");
-  if (cleaned.length < 9) return res.json({ success: true, vouchers: [] });
+  const hist = await History.find().lean();
 
-  const hist = await History.find({}).lean();
+  const match = hist.filter(h => (h.usedBy || "").endsWith(phone));
 
-  const matches = hist.filter(h => {
-    const p = (h.usedBy || "").replace(/\D/g, "");
-    return p.endsWith(cleaned);
-  });
-
-  const urls = matches.map(h => `${R2_PUBLIC_URL}/${h.filename}`);
+  const urls = match.map(h => `${R2_PUBLIC_URL}/${encodeURIComponent(h.filename)}`);
 
   res.json({ success: true, vouchers: urls });
 });
@@ -416,4 +385,6 @@ app.get("/api/public/history", async (req, res) => {
 // -------------------------------------------------------
 // START SERVER
 // -------------------------------------------------------
-app.listen(PORT, () => console.log(`🚀 Smart WASSCE Backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
