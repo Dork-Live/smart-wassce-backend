@@ -90,7 +90,6 @@ async function getNextSequence(name) {
 }
 
 const VoucherSchema = new mongoose.Schema({
-<<<<<<< HEAD
   cardId: Number,
   filename: String,     // stored file name
   r2url: String,        // public URL
@@ -99,16 +98,6 @@ const VoucherSchema = new mongoose.Schema({
   uploadedAt: Date,
   usedAt: Date,
   reference: String
-=======
-  cardId: { type: Number, required: true, unique: true },
-  filename: { type: String, required: true }, // object key used in R2
-  r2url: { type: String },                     // public URL for direct access
-  status: { type: String, enum: ["unused", "used", "archived"], default: "unused" },
-  batchId: { type: String },
-  uploadedAt: { type: Date, default: Date.now },
-  usedAt: { type: Date },
-  reference: { type: String }, // paystack reference if used
->>>>>>> ee9e7ef0c236a88b80307523c51a9b512850cdac
 });
 const Voucher = mongoose.model("Voucher", VoucherSchema);
 
@@ -134,51 +123,15 @@ const r2 = new S3Client({
   }
 });
 
-<<<<<<< HEAD
 // -------------------------------------------------------
 // Express App Setup
 // -------------------------------------------------------
-=======
-// helper to upload to R2 (PutObject)
-async function uploadToR2(buffer, key, contentType = "image/jpeg") {
-  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
-  const cmd = new PutObjectCommand({
-    Bucket: R2_BUCKET,
-    Key: key,
-    Body: buffer,
-    ContentType: contentType,
-    // You can set ACL or metadata here if needed.
-  });
-  await s3.send(cmd);
-  return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(key)}`;
-}
-
-// helper to delete from R2 (DeleteObject)
-async function deleteFromR2(key) {
-  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
-  const cmd = new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key });
-  await s3.send(cmd);
-}
-
-// -------------------------
-// Express app
-// -------------------------
->>>>>>> ee9e7ef0c236a88b80307523c51a9b512850cdac
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json({ limit: "5mb" }));
 app.use(cookieParser());
 
-<<<<<<< HEAD
 // ----------------- Multer (Memory Upload to R2) -----------------
-=======
-// NOTE: No local /uploads static serving — we rely on R2 public URLs
-
-// -------------------------
-// Multer config (memory storage — upload straight from memory to R2)
-// -------------------------
-const memStorage = multer.memoryStorage();
->>>>>>> ee9e7ef0c236a88b80307523c51a9b512850cdac
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB each
@@ -216,7 +169,6 @@ function requireAdmin(req, res, next) {
   }
 }
 
-<<<<<<< HEAD
 // ----------------------
 // R2 helpers
 // ----------------------
@@ -243,60 +195,6 @@ async function deleteFromR2(key) {
 // Upload vouchers (admin) — memory multer -> R2 -> DB
 // multipart/form-data, field name "vouchers"
 // ----------------------
-=======
-// -------------------------
-// Helpers
-// -------------------------
-// allocateUnused now returns r2url from DB
-async function allocateUnused(qty, reference = null, phone = "unknown", email = null) {
-  // find N unused vouchers by cardId ascending
-  const unused = await Voucher.find({ status: "unused" }).sort({ cardId: 1 }).limit(qty);
-  if (unused.length < qty) return null;
-
-  const ids = unused.map(u => u._id);
-  await Voucher.updateMany({ _id: { $in: ids } }, { $set: { status: "used", usedAt: new Date(), reference } });
-
-  const hist = unused.map(u => ({
-    cardId: u.cardId,
-    filename: u.filename,
-    usedBy: phone,
-    usedByEmail: email || null,
-    reference: reference || null,
-    dateUsed: new Date(),
-  }));
-  await History.insertMany(hist);
-
-  return unused.map(u => ({ id: u.cardId, filename: u.filename, url: u.r2url }));
-}
-
-// -------------------------
-// Routes
-// -------------------------
-app.get("/", (req, res) => res.send("✅ Smart WASSCE backend (Mongo + Paystack webhook)"));
-
-/**
- * Admin login -> returns JWT token
- * Body: { email, password }
- */
-app.post("/api/admin/login", (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ success: false, error: "Missing credentials" });
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ success: false, error: "Invalid credentials" });
-  }
-  const token = signAdminToken({ email });
-  return res.json({ success: true, token, email });
-});
-
-app.post("/api/admin/logout", (req, res) => {
-  return res.json({ success: true });
-});
-
-/**
- * Upload vouchers (admin) — upload straight to R2 and save DB doc
- * multer.memoryStorage -> file.buffer
- */
->>>>>>> ee9e7ef0c236a88b80307523c51a9b512850cdac
 app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 50), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0)
@@ -411,69 +309,19 @@ app.get("/api/history", requireAdmin, async (req, res) => {
   }
 });
 
-<<<<<<< HEAD
 // ----------------------
 // FIND by reference (public) — returns r2 URLs for that reference
 // ----------------------
-=======
-/**
- * DELETE /api/voucher/:id  (admin)
- * - deletes the object from R2 (if present)
- * - deletes the Voucher document
- * - DOES NOT delete History (you chose B)
- */
-app.delete("/api/voucher/:id", requireAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!id) return res.status(400).json({ success: false, error: "Missing id" });
-
-    // look up by cardId or Mongo _id (allow both)
-    let voucher = await Voucher.findOne({ cardId: Number(id) }).lean();
-    if (!voucher) voucher = await Voucher.findById(id).lean();
-    if (!voucher) return res.status(404).json({ success: false, error: "Voucher not found" });
-
-    // attempt delete from R2 if filename present
-    if (voucher.filename) {
-      try {
-        await deleteFromR2(voucher.filename);
-      } catch (e) {
-        console.warn("R2 delete failed or object not found:", e.message || e);
-        // continue — we'll still remove the DB doc to keep admin view accurate
-      }
-    }
-
-    // delete voucher doc from DB
-    await Voucher.deleteOne({ _id: voucher._id });
-
-    return res.json({ success: true, message: "Voucher deleted (history preserved)." });
-  } catch (err) {
-    console.error("Delete voucher error:", err);
-    return res.status(500).json({ success: false, error: "Failed to delete voucher", details: err.message });
-  }
-});
-
-/**
- * GET /api/find-by-reference/:ref
- * Returns voucher URLs previously allocated for this reference (idempotent)
- */
->>>>>>> ee9e7ef0c236a88b80307523c51a9b512850cdac
 app.get("/api/find-by-reference/:ref", async (req, res) => {
   try {
     const ref = req.params.ref;
     if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
-<<<<<<< HEAD
 
     const hist = await History.find({ reference: ref }).lean();
     if (!hist.length) return res.json({ success: false, error: "No vouchers found for this reference" });
 
     const urls = hist.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
     return res.json({ success: true, vouchers: urls });
-=======
-    const history = await History.find({ reference: ref }).lean();
-    if (!history.length) return res.json({ success: false, error: "No vouchers found for this reference" });
-    const urls = history.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
-    return res.json({ success: true, vouchers: urls, message: "Found" });
->>>>>>> ee9e7ef0c236a88b80307523c51a9b512850cdac
   } catch (err) {
     console.error("find-by-reference error:", err);
     return res.status(500).json({ success: false, error: "Server error" });
@@ -721,9 +569,5 @@ app.get("/api/public/history", async (req, res) => {
 // START SERVER
 // ----------------------
 app.listen(PORT, () => {
-<<<<<<< HEAD
   console.log(`🚀 Backend running on port ${PORT}`);
 });
-=======
-  console.log(`✅ Backend running on port ${PORT}`);
-});-
