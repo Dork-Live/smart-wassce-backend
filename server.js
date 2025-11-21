@@ -479,7 +479,37 @@ app.get("/api/public/history", async (req, res) => {
     return res.status(500).json({ success: false, error: "Server error" });
   }
 });
+// -------------------------------------------------------
+// SECURE DOWNLOAD PROXY (Fixes R2 CORS download issues)
+// -------------------------------------------------------
+app.get("/api/download", async (req, res) => {
+  try {
+    const fileUrl = req.query.url;
+    if (!fileUrl) {
+      return res.status(400).send("Missing file URL");
+    }
 
+    console.log("Downloading:", fileUrl);
+
+    // Fetch the file from R2
+    const response = await fetch(fileUrl);
+
+    if (!response.ok) {
+      return res.status(500).send("Failed to fetch file");
+    }
+
+    // Set headers to force download
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Content-Disposition", "attachment; filename=voucher.jpg");
+
+    // Stream to client
+    response.body.pipe(res);
+
+  } catch (err) {
+    console.error("Download error:", err);
+    res.status(500).send("Server download error");
+  }
+});
 // -------------------------------------------------------
 // START SERVER
 // -------------------------------------------------------
