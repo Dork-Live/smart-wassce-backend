@@ -1,4 +1,7 @@
-// server.js — Smart WASSCE backend (Mongoose + Paystack webhook + Admin JWT + Cloudflare R2)
+// =======================================================
+// Smart WASSCE — Backend (MongoDB + Paystack + R2 Storage)
+// =======================================================
+
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
@@ -13,81 +16,88 @@ import crypto from "crypto";
 import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
 
+// Load env
 dotenv.config();
 
-// --- __dirname for ESM (kept if you need local files later)
+// dirname (ESM)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// --- Config (via .env in Render or your host)
+// -------------------------------------------------------
+// Environment Config
+// -------------------------------------------------------
 const PORT = process.env.PORT || 4000;
-const MONGO_URI = process.env.MONGO_URI || "";
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
+const MONGO_URI = process.env.MONGO_URI;
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
+
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL || `${BASE_URL}/success.html`;
-const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 25);
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@gmail.com";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
-const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || "change-this-secret";
 
-// R2 config — MUST be provided in env
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
-const R2_BUCKET = process.env.R2_BUCKET || ""; // bucket name
-const R2_ENDPOINT = process.env.R2_ENDPOINT || ""; // e.g. https://<account>.r2.dev
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || ""; // e.g. https://pub-....r2.dev
+const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 25);
+
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET;
+
+// ----------- R2 STORAGE SETTINGS -------------
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET;  // bucket name only
+const R2_ENDPOINT = process.env.R2_ENDPOINT; // example: https://<accountid>.r2.cloudflarestorage.com
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL; // example: https://pub-xxxxx.r2.dev
 
 if (!R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_ENDPOINT || !R2_PUBLIC_URL) {
-  console.warn("⚠️ R2 configuration missing. Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT, R2_PUBLIC_URL in env.");
+  console.error("❌ Missing R2 env variables!");
+  console.error("You MUST set: R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT, R2_PUBLIC_URL");
+  process.exit(1);
 }
 
-// -------------------------
-// Connect to MongoDB
-// -------------------------
-async function connectDb() {
-  if (!MONGO_URI) {
-    console.error("MONGO_URI not set in environment.");
+// -------------------------------------------------------
+// Mongoose Connection
+// -------------------------------------------------------
+async function connectDB() {
+  try {
+    await mongoose.connect(MONGO_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log("✅ MongoDB connected");
+  } catch (err) {
+    console.error("❌ MongoDB connection error:", err);
     process.exit(1);
   }
-  await mongoose.connect(MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  });
-  console.log("✅ Connected to MongoDB");
 }
-connectDb().catch((err) => {
-  console.error("Mongo connect error:", err);
-  process.exit(1);
-});
+connectDB();
 
-// -------------------------
-// Mongoose Schemas
-// -------------------------
+// -------------------------------------------------------
+// Database Schemas
+// -------------------------------------------------------
+
 const CounterSchema = new mongoose.Schema({
-  name: { type: String, required: true, unique: true },
-  seq: { type: Number, default: 0 },
+  name: String,
+  seq: Number
 });
 const Counter = mongoose.model("Counter", CounterSchema);
 
-async function getNextSequence(name, inc = 1) {
+async function getNextSequence(name) {
   const doc = await Counter.findOneAndUpdate(
     { name },
-    { $inc: { seq: inc } },
+    { $inc: { seq: 1 } },
     { new: true, upsert: true }
   );
   return doc.seq;
 }
 
 const VoucherSchema = new mongoose.Schema({
-  cardId: { type: Number, required: true, unique: true },
-  filename: { type: String, required: true }, // the object key used in R2
-  r2url: { type: String },                     // public URL for direct access
-  status: { type: String, enum: ["unused", "used", "archived"], default: "unused" },
-  batchId: { type: String },
-  uploadedAt: { type: Date, default: Date.now },
-  usedAt: { type: Date },
-  reference: { type: String }, // paystack reference if used
+  cardId: Number,
+  filename: String,     // stored file name
+  r2url: String,        // public URL
+  status: { type: String, default: "unused" }, // unused, used
+  batchId: String,
+  uploadedAt: Date,
+  usedAt: Date,
+  reference: String
 });
 const Voucher = mongoose.model("Voucher", VoucherSchema);
 
@@ -97,167 +107,109 @@ const HistorySchema = new mongoose.Schema({
   usedBy: String,
   usedByEmail: String,
   reference: String,
-  dateUsed: { type: Date, default: Date.now },
+  dateUsed: Date
 });
 const History = mongoose.model("History", HistorySchema);
 
-// -------------------------
-// S3 (R2) Client
-// -------------------------
-const s3 = new S3Client({
+// -------------------------------------------------------
+// Cloudflare R2 Client
+// -------------------------------------------------------
+const r2 = new S3Client({
   region: "auto",
-  endpoint: R2_ENDPOINT || undefined,
+  endpoint: R2_ENDPOINT,
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
-  },
-  forcePathStyle: false,
+  }
 });
 
-// -------------------------
-// Express app
-// -------------------------
+// -------------------------------------------------------
+// Express App Setup
+// -------------------------------------------------------
 const app = express();
-
 app.use(cors({ origin: true, credentials: true }));
-app.use(bodyParser.json({ limit: "2mb" }));
+app.use(bodyParser.json({ limit: "5mb" }));
 app.use(cookieParser());
 
-// NOTE: No local /uploads static serving — we're R2-only now
-
-// -------------------------
-// Multer config (memory storage — upload straight from memory to R2)
-// -------------------------
-const memStorage = multer.memoryStorage();
+// ----------------- Multer (Memory Upload to R2) -----------------
 const upload = multer({
-  storage: memStorage,
-  limits: { files: 50, fileSize: 8 * 1024 * 1024 }, // adjust as needed
-  fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if ([".jpg", ".jpeg", ".png"].includes(ext)) cb(null, true);
-    else cb(new Error("Only JPG/JPEG/PNG allowed"));
-  },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB each
 });
+// ----------------------
+// PART 2 — Upload / Admin routes / R2 helpers
+// ----------------------
 
-// -------------------------
-// Admin auth (JWT)
-// -------------------------
+// ----------------------
+// Admin auth helper
+// ----------------------
 function signAdminToken(payload = {}) {
-  return jwt.sign(payload, ADMIN_JWT_SECRET, { expiresIn: "12h" });
+  return jwt.sign(payload, ADMIN_JWT_SECRET || "change-me", { expiresIn: "12h" });
 }
 function verifyAdminToken(token) {
-  try {
-    return jwt.verify(token, ADMIN_JWT_SECRET);
-  } catch (e) {
-    return null;
-  }
+  try { return jwt.verify(token, ADMIN_JWT_SECRET || "change-me"); }
+  catch (e) { return null; }
 }
 function requireAdmin(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  let token = null;
-  if (authHeader.startsWith("Bearer ")) token = authHeader.split(" ")[1];
-  else if (req.cookies?.admin_token) token = req.cookies.admin_token;
-  else if (req.headers["x-admin-token"]) token = req.headers["x-admin-token"];
+  try {
+    const auth = req.headers.authorization || "";
+    let token = null;
+    if (auth.startsWith("Bearer ")) token = auth.split(" ")[1];
+    else if (req.cookies && req.cookies.admin_token) token = req.cookies.admin_token;
+    else if (req.headers["x-admin-token"]) token = req.headers["x-admin-token"];
 
-  if (!token) return res.status(401).json({ success: false, error: "Unauthorized - no token" });
+    if (!token) return res.status(401).json({ success: false, error: "Unauthorized - no token" });
+    const payload = verifyAdminToken(token);
+    if (!payload) return res.status(401).json({ success: false, error: "Unauthorized - invalid token" });
 
-  const payload = verifyAdminToken(token);
-  if (!payload) return res.status(401).json({ success: false, error: "Unauthorized - invalid token" });
-
-  req.admin = payload;
-  next();
+    req.admin = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
 }
 
-// -------------------------
-// Helpers
-// -------------------------
+// ----------------------
+// R2 helpers
+// ----------------------
+import { PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+
 async function uploadToR2(buffer, key, contentType = "image/jpeg") {
-  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
   const cmd = new PutObjectCommand({
     Bucket: R2_BUCKET,
     Key: key,
     Body: buffer,
     ContentType: contentType,
-    // Note: R2 buckets can be configured public (or use signed URLs)
+    ACL: "public-read" // Cloudflare R2 ignores ACL but harmless
   });
-  await s3.send(cmd);
-  // Construct public URL — rely on R2 public hostname
+  await r2.send(cmd);
   return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(key)}`;
 }
 
 async function deleteFromR2(key) {
-  if (!R2_BUCKET || !R2_ENDPOINT) throw new Error("R2 not configured");
   const cmd = new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key });
-  await s3.send(cmd);
+  await r2.send(cmd);
 }
 
-// allocateUnused now returns r2url from DB
-async function allocateUnused(qty, reference = null, phone = "unknown", email = null) {
-  // find N unused vouchers by cardId ascending
-  const unused = await Voucher.find({ status: "unused" }).sort({ cardId: 1 }).limit(qty);
-  if (unused.length < qty) return null;
-
-  const ids = unused.map(u => u._id);
-  await Voucher.updateMany({ _id: { $in: ids } }, { $set: { status: "used", usedAt: new Date(), reference } });
-
-  const hist = unused.map(u => ({
-    cardId: u.cardId,
-    filename: u.filename,
-    usedBy: phone,
-    usedByEmail: email || null,
-    reference: reference || null,
-    dateUsed: new Date(),
-  }));
-  await History.insertMany(hist);
-
-  return unused.map(u => ({ id: u.cardId, filename: u.filename, url: u.r2url }));
-}
-
-// -------------------------
-// Routes
-// -------------------------
-app.get("/", (req, res) => res.send("✅ Smart WASSCE backend (Mongo + Paystack webhook)"));
-
-/**
- * Admin login -> returns JWT token
- * Body: { email, password }
- */
-app.post("/api/admin/login", (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ success: false, error: "Missing credentials" });
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ success: false, error: "Invalid credentials" });
-  }
-  const token = signAdminToken({ email });
-  return res.json({ success: true, token, email });
-});
-
-app.post("/api/admin/logout", (req, res) => {
-  return res.json({ success: true });
-});
-
-/**
- * Upload vouchers (admin) — upload straight to R2 and save DB doc
- * multer.memoryStorage -> file.buffer
- */
+// ----------------------
+// Upload vouchers (admin) — memory multer -> R2 -> DB
+// multipart/form-data, field name "vouchers"
+// ----------------------
 app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 50), async (req, res) => {
   try {
-    if (!req.files || req.files.length === 0) return res.status(400).json({ success: false, error: "No files" });
-    if (!R2_BUCKET || !R2_ENDPOINT) return res.status(500).json({ success: false, error: "R2 not configured" });
+    if (!req.files || req.files.length === 0)
+      return res.status(400).json({ success: false, error: "No files uploaded" });
 
     const batchId = `batch-${Date.now()}`;
     const added = [];
 
     for (const file of req.files) {
-      const seq = await getNextSequence("voucherSeq", 1);
+      const seq = await getNextSequence("voucherSeq");
       const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
       const newFilename = `voucher_${seq}${ext}`;
       const contentType = file.mimetype || "image/jpeg";
-
       // upload to R2
-      await uploadToR2(file.buffer, newFilename, contentType);
-
-      const r2url = `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(newFilename)}`;
+      const r2url = await uploadToR2(file.buffer, newFilename, contentType);
 
       const v = new Voucher({
         cardId: seq,
@@ -265,7 +217,7 @@ app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 50), asy
         r2url,
         status: "unused",
         batchId,
-        uploadedAt: new Date(),
+        uploadedAt: new Date()
       });
       await v.save();
 
@@ -279,260 +231,343 @@ app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 50), asy
   }
 });
 
-/**
- * GET /api/vouchers/all (admin)
- */
+// ----------------------
+// GET all vouchers (admin) — return r2url
+// ----------------------
 app.get("/api/vouchers/all", requireAdmin, async (req, res) => {
   try {
     const vouchers = await Voucher.find({}).sort({ cardId: 1 }).lean();
-    // ensure we return r2url for frontend
     const mapped = vouchers.map(v => ({
       ...v,
-      r2url: v.r2url || (v.filename ? `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(v.filename)}` : null),
+      r2url: v.r2url || (v.filename ? `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(v.filename)}` : null)
     }));
     return res.json({ success: true, vouchers: mapped });
   } catch (err) {
-    console.error(err);
+    console.error("Read vouchers error:", err);
     return res.status(500).json({ success: false, error: "Failed to read vouchers" });
   }
 });
 
-/**
- * GET /api/history (admin)
- */
+// ----------------------
+// GET single voucher by id (admin)
+// ----------------------
+app.get("/api/voucher/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const v = await Voucher.findOne({ cardId: id }).lean();
+    if (!v) return res.status(404).json({ success: false, error: "Voucher not found" });
+    v.r2url = v.r2url || (v.filename ? `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(v.filename)}` : null);
+    return res.json({ success: true, voucher: v });
+  } catch (err) {
+    console.error("Get voucher error:", err);
+    return res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ----------------------
+// DELETE single voucher by id (admin)
+// - deletes object from R2 if filename present
+// - removes DB voucher doc
+// - DOES NOT touch History (so past purchases remain)
+// ----------------------
+app.delete("/api/voucher/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const v = await Voucher.findOne({ cardId: id }).lean();
+    if (!v) return res.status(404).json({ success: false, error: "Voucher not found" });
+
+    // delete from R2 (best-effort)
+    if (v.filename) {
+      try {
+        await deleteFromR2(v.filename);
+      } catch (e) {
+        console.warn("R2 delete failed for", v.filename, e.message);
+        // continue — still attempt DB deletion
+      }
+    }
+
+    // remove from DB
+    await Voucher.deleteOne({ cardId: id });
+
+    return res.json({ success: true, message: `Deleted voucher ${id}` });
+  } catch (err) {
+    console.error("Delete voucher error:", err);
+    return res.status(500).json({ success: false, error: "Failed to delete voucher" });
+  }
+});
+
+// ----------------------
+// GET history (admin)
+// ----------------------
 app.get("/api/history", requireAdmin, async (req, res) => {
   try {
     const history = await History.find({}).sort({ dateUsed: -1 }).lean();
     return res.json({ success: true, history });
   } catch (err) {
-    console.error(err);
+    console.error("Read history error:", err);
     return res.status(500).json({ success: false, error: "Failed to read history" });
   }
 });
 
-/**
- * DELETE /api/vouchers/used (admin)
- * Removes used voucher records and deletes the objects from R2.
- * We mark DB records 'archived' or delete them depending on your choice — here we delete DB docs for used vouchers.
- */
-app.delete("/api/vouchers/used", requireAdmin, async (req, res) => {
-  try {
-    const used = await Voucher.find({ status: "used" }).lean();
-    if (!used.length) return res.json({ success: true, message: "No used vouchers" });
-
-    let deletedCount = 0;
-    for (const v of used) {
-      try {
-        if (v.filename) {
-          await deleteFromR2(v.filename);
-        }
-        deletedCount++;
-      } catch (e) {
-        console.warn("Failed to delete from R2 for", v.filename, e.message);
-      }
-    }
-
-    // remove used docs from DB
-    const result = await Voucher.deleteMany({ status: "used" });
-    // Optionally you may also delete corresponding History entries. Here we keep history.
-    return res.json({ success: true, message: `Deleted ${result.deletedCount} used vouchers (attempted R2 deletion of ${deletedCount}).` });
-  } catch (err) {
-    console.error("Delete used error:", err);
-    return res.status(500).json({ success: false, error: "Failed to delete used vouchers", details: err.message });
-  }
-});
-
-/**
- * GET /api/find-by-reference/:ref
- * Returns voucher URLs previously allocated for this reference (idempotent)
- */
+// ----------------------
+// FIND by reference (public) — returns r2 URLs for that reference
+// ----------------------
 app.get("/api/find-by-reference/:ref", async (req, res) => {
   try {
     const ref = req.params.ref;
     if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
-    const history = await History.find({ reference: ref }).lean();
-    if (!history.length) return res.json({ success: false, error: "No vouchers found for this reference" });
-    const urls = history.map(h => {
-      // prefer r2url if voucher exists
-      if (h.filename) return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`;
-      return null;
-    }).filter(Boolean);
-    return res.json({ success: true, vouchers: urls, message: "Found" });
+
+    const hist = await History.find({ reference: ref }).lean();
+    if (!hist.length) return res.json({ success: false, error: "No vouchers found for this reference" });
+
+    const urls = hist.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
+    return res.json({ success: true, vouchers: urls });
   } catch (err) {
     console.error("find-by-reference error:", err);
     return res.status(500).json({ success: false, error: "Server error" });
   }
 });
+// ----------------------
+// Allocate Unused Vouchers (R2 version)
+// ----------------------
+async function allocateUnused(qty, reference = null, phone = "unknown", email = null) {
+  const unused = await Voucher.find({ status: "unused" })
+    .sort({ cardId: 1 })
+    .limit(qty);
 
-/**
- * POST /api/pay
- * Initialize Paystack transaction
- * Body: { email, phone, quantity, amount }
- */
+  if (unused.length < qty) return null;
+
+  const ids = unused.map(u => u._id);
+
+  // mark as used
+  await Voucher.updateMany(
+    { _id: { $in: ids } },
+    { $set: { status: "used", usedAt: new Date(), reference } }
+  );
+
+  // history log
+  const hist = unused.map(u => ({
+    cardId: u.cardId,
+    filename: u.filename,
+    usedBy: phone,
+    usedByEmail: email || null,
+    reference,
+    dateUsed: new Date()
+  }));
+
+  await History.insertMany(hist);
+
+  // return R2 URLs
+  return unused.map(u => ({
+    id: u.cardId,
+    filename: u.filename,
+    url: `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(u.filename)}`
+  }));
+}
+
+// ----------------------
+// Paystack INITIATE PAYMENT
+// ----------------------
 app.post("/api/pay", async (req, res) => {
   try {
     const { email, phone, quantity, amount } = req.body || {};
-    if (!email || !phone || !quantity || !amount) return res.status(400).json({ success: false, error: "Missing fields" });
+    if (!email || !phone || !quantity || !amount)
+      return res.status(400).json({ success: false, error: "Missing fields" });
 
     const expected = Number(quantity) * PRICE_PER_VOUCHER;
-    if (Number(amount) !== expected) return res.status(400).json({ success: false, error: `Amount mismatch. Expected ${expected}` });
+    if (Number(amount) !== expected)
+      return res.status(400).json({ success: false, error: `Amount mismatch. Expected ${expected}` });
 
     const unusedCount = await Voucher.countDocuments({ status: "unused" });
-    if (unusedCount < quantity) return res.status(400).json({ success: false, error: `Only ${unusedCount} voucher(s) available.` });
+    if (unusedCount < quantity)
+      return res.status(400).json({
+        success: false,
+        error: `Only ${unusedCount} voucher(s) available.`
+      });
 
-    if (!PAYSTACK_SECRET_KEY) return res.status(500).json({ success: false, error: "Paystack key not configured" });
+    if (!PAYSTACK_SECRET_KEY)
+      return res.status(500).json({ success: false, error: "Paystack key missing" });
 
     const payload = {
       email,
       amount: Number(amount) * 100,
       metadata: { phone, quantity },
-      callback_url: FRONTEND_SUCCESS_URL,
+      callback_url: FRONTEND_SUCCESS_URL
     };
 
-    const response = await axios.post("https://api.paystack.co/transaction/initialize", payload, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
-    });
+    const response = await axios.post(
+      "https://api.paystack.co/transaction/initialize",
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
 
     return res.json(response.data);
+
   } catch (err) {
-    console.error("Pay init error:", err.response?.data || err.message);
-    return res.status(500).json({ success: false, error: "Payment initialization failed", details: err.response?.data || err.message });
+    console.error("PAY INIT ERROR:", err.response?.data || err.message);
+    return res.status(500).json({
+      success: false,
+      error: "Payment initialization failed",
+      details: err.response?.data
+    });
   }
 });
 
-/**
- * GET /api/verify/:reference
- * Verifies with Paystack (if not yet allocated) and allocates vouchers.
- */
+// ----------------------
+// Paystack VERIFY route
+// ----------------------
 app.get("/api/verify/:reference", async (req, res) => {
   try {
     const ref = req.params.reference;
-    if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
-    if (!PAYSTACK_SECRET_KEY) return res.status(500).json({ success: false, error: "Paystack key not configured" });
 
-    // If we already have history, return immediately
+    if (!ref)
+      return res.status(400).json({ success: false, error: "Missing reference" });
+
+    if (!PAYSTACK_SECRET_KEY)
+      return res.status(500).json({ success: false, error: "Paystack key missing" });
+
+    // idempotency: return already allocated vouchers
     const existing = await History.find({ reference: ref }).lean();
     if (existing.length > 0) {
-      const urls = existing.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
+      const urls = existing.map(h =>
+        `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`
+      );
       return res.json({ success: true, vouchers: urls, message: "Already verified" });
     }
 
     // verify with Paystack
-    const verifyResp = await axios.get(`https://api.paystack.co/transaction/verify/${encodeURIComponent(ref)}`, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
-    });
+    const verifyResp = await axios.get(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(ref)}`,
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
+    );
+
     const payload = verifyResp.data;
-    if (!payload.status || payload.data.status !== "success") {
+    if (!payload.status || payload.data.status !== "success")
       return res.status(400).json({ success: false, error: "Payment not successful" });
-    }
 
     const metadata = payload.data.metadata || {};
     let quantity = parseInt(metadata.quantity, 10);
-    if (!quantity || isNaN(quantity)) quantity = Math.round(Number(payload.data.amount) / (PRICE_PER_VOUCHER * 100));
-    if (quantity < 1) quantity = 1;
-    if (quantity > 100) quantity = 100;
 
-    const phone = metadata.phone || (payload.data.customer && payload.data.customer.phone) || "unknown";
+    if (!quantity || isNaN(quantity)) {
+      quantity = Math.round(
+        Number(payload.data.amount) / (PRICE_PER_VOUCHER * 100)
+      );
+    }
+
+    const phone = metadata.phone || payload.data.customer?.phone || "unknown";
     const email = payload.data.customer?.email || null;
 
-    // allocate vouchers (atomic-ish)
     const assigned = await allocateUnused(quantity, ref, phone, email);
-    if (!assigned) {
-      return res.status(400).json({ success: false, error: "Payment successful but not enough vouchers left." });
-    }
+
+    if (!assigned)
+      return res.status(400).json({
+        success: false,
+        error: "Payment OK but no vouchers left"
+      });
 
     return res.json({ success: true, vouchers: assigned.map(a => a.url), assigned });
+
   } catch (err) {
-    console.error("Verify error:", err.response?.data || err.message);
-    return res.status(500).json({ success: false, error: "Verification failed", details: err.response?.data || err.message });
+    console.error("VERIFY ERROR:", err.response?.data || err.message);
+    return res.status(500).json({ success: false, error: "Verification failed" });
   }
 });
 
-/**
- * POST /api/paystack/webhook
- * Paystack will POST transaction events here (use in Paystack dashboard -> Webhooks)
- * We verify the X-Paystack-Signature header (HMAC SHA512).
- */
-app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    const signature = req.headers["x-paystack-signature"];
-    const computed = crypto.createHmac("sha512", PAYSTACK_WEBHOOK_SECRET).update(req.body).digest("hex");
-    if (signature !== computed) {
-      console.warn("Webhook signature mismatch");
-      return res.status(400).send("Invalid signature");
+// ----------------------
+// PAYSTACK WEBHOOK
+// ----------------------
+app.post(
+  "/api/paystack/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const signature = req.headers["x-paystack-signature"];
+      const computed = crypto
+        .createHmac("sha512", PAYSTACK_WEBHOOK_SECRET)
+        .update(req.body)
+        .digest("hex");
+
+      if (signature !== computed) {
+        console.warn("Webhook signature mismatch");
+        return res.status(400).send("Invalid signature");
+      }
+
+      const payload = JSON.parse(req.body.toString("utf8"));
+      const data = payload.data;
+
+      if (!data || data.status !== "success")
+        return res.status(200).send("ignored");
+
+      const ref = data.reference;
+      if (!ref) return res.status(400).send("no reference");
+
+      // idempotent check
+      const existing = await History.find({ reference: ref }).lean();
+      if (existing.length > 0) return res.status(200).send("already processed");
+
+      const metadata = data.metadata || {};
+      let quantity = parseInt(metadata.quantity, 10);
+
+      if (!quantity || isNaN(quantity)) {
+        quantity = Math.round(Number(data.amount) / (PRICE_PER_VOUCHER * 100));
+      }
+
+      const phone = metadata.phone || data.customer?.phone || "unknown";
+      const email = data.customer?.email || null;
+
+      const allocated = await allocateUnused(quantity, ref, phone, email);
+
+      if (!allocated) return res.status(200).send("insufficient vouchers");
+
+      return res.status(200).send("ok");
+
+    } catch (err) {
+      console.error("Webhook error:", err);
+      return res.status(500).send("error");
     }
-
-    const payload = JSON.parse(req.body.toString("utf8"));
-    const data = payload.data || payload;
-    if (!data || data.status !== "success") return res.status(200).send("ignored");
-
-    const ref = data.reference || data.trxref || data.id || null;
-    if (!ref) return res.status(400).send("no reference");
-
-    // idempotent: skip if history exists
-    const existing = await History.find({ reference: ref }).lean();
-    if (existing.length > 0) {
-      console.log(`Webhook: reference ${ref} already processed`);
-      return res.status(200).send("already-processed");
-    }
-
-    const metadata = data.metadata || {};
-    let quantity = parseInt(metadata.quantity, 10);
-    if (!quantity || isNaN(quantity)) {
-      quantity = Math.round(Number(data.amount) / (PRICE_PER_VOUCHER * 100));
-    }
-    if (quantity < 1) quantity = 1;
-    if (quantity > 100) quantity = 100;
-
-    const phone = metadata.phone || (data.customer && data.customer.phone) || "unknown";
-    const email = data.customer?.email || null;
-
-    const allocated = await allocateUnused(quantity, ref, phone, email);
-    if (!allocated) {
-      console.error(`Webhook: Payment success but insufficient vouchers for ref ${ref}`);
-      return res.status(200).send("insufficient-vouchers");
-    }
-
-    console.log(`Webhook: allocated ${allocated.length} vouchers for ref ${ref}`);
-    return res.status(200).send("ok");
-  } catch (err) {
-    console.error("Webhook handler error:", err);
-    return res.status(500).send("error");
   }
-});
+);
 
-/**
- * GET /api/public/history
- * Public route — lookup vouchers by phone ONLY
- * Example: /api/public/history?phone=0241234567
- */
+// ----------------------
+// PUBLIC SEARCH BY PHONE
+// ----------------------
 app.get("/api/public/history", async (req, res) => {
   try {
-    const rawPhone = (req.query.phone || "").trim();
-    if (!rawPhone) return res.status(400).json({ success: false, error: "Missing phone number" });
+    const phoneRaw = (req.query.phone || "").trim();
 
-    const cleaned = rawPhone.replace(/\D/g, "");
+    if (!phoneRaw)
+      return res.status(400).json({ success: false, error: "Missing phone" });
+
+    const cleaned = phoneRaw.replace(/\D/g, "");
     if (cleaned.length < 9) return res.json({ success: true, vouchers: [] });
 
-    const history = await History.find({}).lean();
+    const hist = await History.find({}).lean();
 
-    const matches = history.filter(h => {
-      const phoneField = (h.usedBy || "").replace(/\D/g, "");
-      return phoneField.endsWith(cleaned);
+    const matches = hist.filter(h => {
+      const p = (h.usedBy || "").replace(/\D/g, "");
+      return p.endsWith(cleaned);
     });
 
-    const vouchers = matches.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
+    const urls = matches.map(h =>
+      `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`
+    );
 
-    res.json({ success: true, vouchers });
+    return res.json({ success: true, vouchers: urls });
+
   } catch (err) {
-    console.error("Public history error:", err);
-    res.status(500).json({ success: false, error: "Server error" });
+    console.error("phone history error:", err);
+    return res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
-// -------------------------
-// Start server
-// -------------------------
+// ----------------------
+// START SERVER
+// ----------------------
 app.listen(PORT, () => {
-  console.log(`✅ Backend running on port ${PORT}`);
+  console.log(`🚀 Backend running on port ${PORT}`);
 });
