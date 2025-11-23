@@ -270,7 +270,79 @@ async function allocateUnused(qty, reference, phone, email) {
 
   return unused.map((v) => `${R2_PUBLIC_URL}/${encodeURIComponent(v.filename)}`);
 }
+// =======================================================
+// PAYSTACK — Initialize Payment
+// POST /api/pay
+// =======================================================
+app.post("/api/pay", async (req, res) => {
+  try {
+    const { email, phone, quantity, amount } = req.body || {};
 
+    if (!email || !phone || !quantity || amount == null) {
+      return res.status(400).json({ success: false, error: "Missing fields" });
+    }
+
+    const qty = Number(quantity);
+    if (!Number.isFinite(qty) || qty < 1) {
+      return res.status(400).json({ success: false, error: "Invalid quantity" });
+    }
+
+    // -------- SAFE PRICE CHECK (avoid float errors) --------
+    const expectedCents = Math.round(qty * PRICE_PER_VOUCHER * 100);   // 22.5 → 2250
+    const incomingCents = Math.round(Number(amount) * 100);
+
+    console.log("[PAY INIT] ", { email, phone, qty, amount, expectedCents, incomingCents });
+
+    if (incomingCents !== expectedCents) {
+      return res.status(400).json({
+        success: false,
+        error: `Amount mismatch. Expected ${(expectedCents/100).toFixed(2)}`
+      });
+    }
+
+    // -------- CHECK AVAILABLE VOUCHERS --------
+    const unusedCount = await Voucher.countDocuments({ status: "unused" });
+    if (unusedCount < qty) {
+      return res.status(400).json({
+        success: false,
+        error: `Only ${unusedCount} voucher(s) available`
+      });
+    }
+
+    if (!PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ success: false, error: "Paystack key not configured" });
+    }
+
+    // -------- INITIALIZE PAYSTACK --------
+    const payload = {
+      email,
+      amount: incomingCents,   // PAYSTACK USES KOBO (integer)
+      metadata: { phone, quantity: qty },
+      callback_url: FRONTEND_SUCCESS_URL,
+    };
+
+    const response = await axios.post(
+      "https://api.paystack.co/transaction/initialize",
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    return res.json(response.data);
+
+  } catch (err) {
+    console.error("PAY INIT ERROR:", err.response?.data || err.message);
+    return res.status(500).json({
+      success: false,
+      error: "Payment initialization failed",
+      details: err.response?.data || err.message
+    });
+  }
+});
 // -------------------------------------------------------
 // Paystack Verify
 // -------------------------------------------------------
