@@ -392,7 +392,45 @@ app.get("/api/verify/:reference", async (req, res) => {
     res.status(500).json({ success: false, error: "Verification failed" });
   }
 });
+// ---------------------------------------------
+// PUBLIC: retrieve by phone + paystack reference
+// GET /api/public/retrieve?phone=...&reference=...
+// ---------------------------------------------
+app.get("/api/public/retrieve", async (req, res) => {
+  try {
+    const rawPhone = String(req.query.phone || "").trim();
+    const rawRef = String(req.query.reference || req.query.ref || "").trim();
 
+    if (!rawPhone || !rawRef) {
+      return res.status(400).json({ success: false, error: "Missing phone or reference" });
+    }
+
+    // Normalize phone: digits only; require at least 7 digits to avoid accidental matches
+    const cleanedPhone = rawPhone.replace(/\D/g, "");
+    if (cleanedPhone.length < 7) {
+      return res.status(400).json({ success: false, error: "Invalid phone number" });
+    }
+
+    const ref = rawRef.trim();
+
+    // Find history entries that match reference exactly and the phone ending (keeps previous behavior)
+    const allHistory = await History.find({ reference: ref }).lean();
+
+    // Filter by phone match (endsWith to support international / local formats)
+    const matches = allHistory.filter(h => {
+      const phoneField = (h.usedBy || "").replace(/\D/g, "");
+      return phoneField.endsWith(cleanedPhone);
+    });
+
+    // Create voucher URLs
+    const vouchers = matches.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
+
+    return res.json({ success: true, vouchers });
+  } catch (err) {
+    console.error("/api/public/retrieve error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ success: false, error: "Server error" });
+  }
+});
 // -------------------------------------------------------
 // PUBLIC SEARCH (Retrieve by phone)
 // -------------------------------------------------------
