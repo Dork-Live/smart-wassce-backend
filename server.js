@@ -15,6 +15,10 @@ import crypto from "crypto";
 import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
 import path from "path";
+import { pipeline } from "stream";
+import { promisify } from "util";
+import { Readable } from "stream";
+const pipelineAsync = promisify(pipeline);
 
 dotenv.config();
 
@@ -522,42 +526,69 @@ app.get("/api/public/history", async (req, res) => {
 // -------------------------------------------------------
 // SECURE DOWNLOAD PROXY (Fixes R2 CORS download issues)
 // -------------------------------------------------------
-import fetch from "node-fetch";  // <-- REQUIRED ON RENDER
+// at top of server.js (if not present already)
 
+
+// === Replace your /api/download handler with this ===
 app.get("/api/download", async (req, res) => {
   try {
     const fileUrl = req.query.url;
-    if (!fileUrl) {
-      return res.status(400).send("Missing file URL");
-    }
+    if (!fileUrl) return res.status(400).send("Missing file URL");
 
-    console.log("Downloading:", fileUrl);
+    console.log("[download] proxying:", fileUrl);
 
-    const encodedUrl = encodeURI(fileUrl);
-
-    const response = await fetch(encodedUrl);
+    // DO NOT re-encode an already encoded URL (avoid double-encoding)
+    const response = await fetch(fileUrl);
 
     if (!response.ok) {
-      console.error("R2 Fetch Error:", response.status);
-      return res.status(500).send("Failed to fetch file from R2");
+      console.error("[download] fetch failed:", response.status, response.statusText);
+      return res.status(502).send("Failed to fetch file from origin");
     }
 
-    // Extract filename from URL
-    const filename = fileUrl.split("/").pop() || "voucher.jpg";
-
-    // Pass through real content type
+    // pick content-type (fallback to octet-stream)
     const contentType = response.headers.get("content-type") || "application/octet-stream";
     res.setHeader("Content-Type", contentType);
 
-    // Force browser download with correct filename
+    // Suggest a filename from the URL so browser offers download
+    const filename = decodeURIComponent((fileUrl.split("/").pop() || "voucher").replace(/["']/g, ""));
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
-    // Pipe file to client
-    response.body.pipe(res);
+    // response.body may be either:
+    // - a Node Readable (has .pipe()) OR
+    // - a WHATWG ReadableStream (no .pipe())
+    const body = response.body;
+
+    if (!body) {
+      console.error("[download] response has no body");
+      return res.status(502).send("Empty response body");
+    }
+
+    // If it's already a Node stream, pipe with pipeline (better error handling)
+    if (typeof body.pipe === "function") {
+      // Node stream -> Node res
+      await pipelineAsync(body, res);
+      return;
+    }
+
+    // Otherwise convert WHATWG stream to Node Readable and pipe
+    // Node 17+ exposes Readable.fromWeb
+    try {
+      const nodeStream = Readable.fromWeb ? Readable.fromWeb(body) : Readable.from(await body.getReader().read());
+      await pipelineAsync(nodeStream, res);
+      return;
+    } catch (convertErr) {
+      // Last resort: read the response as ArrayBuffer and send
+      console.warn("[download] converting WHATWG stream failed, falling back to arrayBuffer", convertErr);
+      const buf = Buffer.from(await response.arrayBuffer());
+      res.setHeader("Content-Length", String(buf.length));
+      res.end(buf);
+      return;
+    }
 
   } catch (err) {
-    console.error("Download error:", err);
-    res.status(500).send("Server download error");
+    console.error("[download] proxy error:", err && err.stack ? err.stack : err);
+    // In case of unexpected error make sure we don't leave an incomplete response
+    try { if (!res.headersSent) res.status(500).send("Server download error"); else res.end(); } catch(e){}
   }
 });
 // -------------------------------------------------------
