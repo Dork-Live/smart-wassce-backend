@@ -459,8 +459,7 @@ app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), asy
 });
 // -------------------------------------------------------
 // SECURE DOWNLOAD PROXY (Fixes R2 CORS download issues)
-// -------------------------------------------------------
-import fetch from "node-fetch";  // <-- REQUIRED ON RENDER
+// ----/ <-- REQUIRED ON RENDER
 
 app.get("/api/download", async (req, res) => {
   try {
