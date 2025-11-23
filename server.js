@@ -378,7 +378,91 @@ app.get("/api/download", async (req, res) => {
     res.status(500).send("Server download error");
   }
 });
+// =======================================================
+// 🔥 DELETE ALL VOUCHERS (DB + Cloudflare R2)
+// =======================================================
+app.delete("/api/vouchers/delete-all", requireAdmin, async (req, res) => {
+  try {
+    const vouchers = await Voucher.find({});
 
+    for (const v of vouchers) {
+      if (v.filename) {
+        try {
+          await deleteFromR2(v.filename);
+        } catch (err) {
+          console.warn("R2 delete failed:", v.filename, err.message);
+        }
+      }
+    }
+
+    await Voucher.deleteMany({});
+    return res.json({ success: true, message: "All vouchers deleted" });
+  } catch (err) {
+    console.error("Delete-all vouchers error:", err);
+    return res.status(500).json({ success: false, error: "Failed to delete all vouchers" });
+  }
+});
+
+// =======================================================
+// 🔥 DELETE ALL HISTORY
+// =======================================================
+app.delete("/api/history/delete-all", requireAdmin, async (req, res) => {
+  try {
+    await History.deleteMany({});
+    return res.json({ success: true, message: "All history cleared" });
+  } catch (err) {
+    console.error("Delete-all history error:", err);
+    return res.status(500).json({ success: false, error: "Failed to delete history" });
+  }
+});
+
+// =======================================================
+// 🔥 EXPORT ALL VOUCHERS (for Excel)
+// =======================================================
+app.get("/api/vouchers/export", requireAdmin, async (req, res) => {
+  try {
+    const vouchers = await Voucher.find({}).lean();
+    return res.json({ success: true, vouchers });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =======================================================
+// 🔥 EXPORT USED VOUCHERS
+// =======================================================
+app.get("/api/vouchers/export-used", requireAdmin, async (req, res) => {
+  try {
+    const vouchers = await Voucher.find({ status: "used" }).lean();
+    return res.json({ success: true, vouchers });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =======================================================
+// 🔥 EXPORT UNUSED VOUCHERS
+// =======================================================
+app.get("/api/vouchers/export-unused", requireAdmin, async (req, res) => {
+  try {
+    const vouchers = await Voucher.find({ status: "unused" }).lean();
+    return res.json({ success: true, vouchers });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =======================================================
+// 🔥 EXPORT FULL HISTORY
+// =======================================================
+app.get("/api/history/export", requireAdmin, async (req, res) => {
+  try {
+    const history = await History.find({}).lean();
+    return res.json({ success: true, history });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
 // -------------------------------------------------------
 // START SERVER
 // -------------------------------------------------------
