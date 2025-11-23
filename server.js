@@ -219,7 +219,18 @@ app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers"), async (
     res.status(500).json({ success: false, error: "Upload failed" });
   }
 });
-
+// -------------------------------------------------------
+// GET Full Purchase / Usage History (Admin)
+// -------------------------------------------------------
+app.get("/api/history", requireAdmin, async (req, res) => {
+  try {
+    const history = await History.find().sort({ dateUsed: -1 }).lean();
+    return res.json({ success: true, history });
+  } catch (err) {
+    console.error("History load error:", err);
+    return res.status(500).json({ success: false, error: "Failed to load history" });
+  }
+});
 // -------------------------------------------------------
 // GET All Vouchers (Admin)
 // -------------------------------------------------------
