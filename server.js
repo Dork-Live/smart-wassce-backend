@@ -34,7 +34,7 @@ const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL || `${BASE_URL}/success.html`;
 
-const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 25);
+const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 22.5);
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@gmail.com";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
