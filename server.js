@@ -584,6 +584,58 @@ app.get("/api/history/export", requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+// =======================================================
+// ⚠ LOW-STOCK ALERT
+// =======================================================
+app.get("/api/admin/low-stock", requireAdmin, async (req, res) => {
+  try {
+    const unused = await Voucher.countDocuments({ status: "unused" });
+    const low = unused < 50;
+
+    return res.json({
+      success: true,
+      unused,
+      low,
+      threshold: 50
+    });
+
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =======================================================
+// 📊 REVENUE ANALYTICS
+// =======================================================
+app.get("/api/admin/revenue-stats", requireAdmin, async (req, res) => {
+  try {
+    const PRICE = PRICE_PER_VOUCHER || 22.5;
+
+    const history = await History.find({}).lean();
+
+    let totalVouchers = history.length;
+    let totalRevenue = totalVouchers * PRICE;
+
+    // Group by day
+    let daily = {};
+    history.forEach(h => {
+      const day = new Date(h.dateUsed).toISOString().split("T")[0];
+      if (!daily[day]) daily[day] = 0;
+      daily[day] += PRICE;
+    });
+
+    return res.json({
+      success: true,
+      totalRevenue,
+      totalVouchers,
+      PRICE,
+      daily
+    });
+
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
 // -------------------------------------------------------
 // START SERVER
 // -------------------------------------------------------
