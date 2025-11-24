@@ -590,7 +590,7 @@ app.get("/api/history/export", requireAdmin, async (req, res) => {
 app.get("/api/admin/low-stock", requireAdmin, async (req, res) => {
   try {
     const unused = await Voucher.countDocuments({ status: "unused" });
-    const low = unused < 50;
+    const low = unused < 5;
 
     return res.json({
       success: true,
