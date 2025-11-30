@@ -1,5 +1,7 @@
+// server.js
 // =======================================================
 // Smart WASSCE — Backend (MongoDB + Paystack + Cloudflare R2)
+// Added: Auto-email generator (auto1@smartwassce.com ...)
 // =======================================================
 
 import express from "express";
@@ -34,6 +36,7 @@ const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL || `${BASE_URL}/success.html`;
 
+// price can be overridden via env; default to 20.5 as you requested
 const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 20.5);
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@gmail.com";
@@ -47,6 +50,7 @@ const R2_BUCKET = process.env.R2_BUCKET || "";
 const R2_ENDPOINT = process.env.R2_ENDPOINT || "";
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || "";
 
+// Basic check
 if (!R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_ENDPOINT || !R2_PUBLIC_URL) {
   console.error("❌ Missing R2 environment variables");
   process.exit(1);
@@ -66,15 +70,32 @@ mongoose
 // -------------------------------------------------------
 // Schemas
 // -------------------------------------------------------
-const Counter = mongoose.model(
-  "Counter",
-  new mongoose.Schema({ name: String, seq: { type: Number, default: 0 } })
-);
+const CounterSchema = new mongoose.Schema({ name: String, seq: { type: Number, default: 0 } });
+const Counter = mongoose.model("Counter", CounterSchema);
 
 async function getNextSequence(name) {
   const doc = await Counter.findOneAndUpdate(
     { name },
     { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return doc.seq;
+}
+
+async function peekSequence(name) {
+  const doc = await Counter.findOneAndUpdate(
+    { name },
+    {},
+    { new: true, upsert: true }
+  );
+  return doc.seq;
+}
+
+async function setSequence(name, value) {
+  const v = Math.max(0, Number(value) || 0);
+  const doc = await Counter.findOneAndUpdate(
+    { name },
+    { $set: { seq: v } },
     { new: true, upsert: true }
   );
   return doc.seq;
@@ -86,7 +107,7 @@ const Voucher = mongoose.model(
     cardId: Number,
     filename: String,
     r2url: String,
-    status: { type: String, default: "unused" },
+    status: { type: String, default: "unused" }, // unused | used | archived
     batchId: String,
     uploadedAt: Date,
     usedAt: Date,
@@ -128,10 +149,10 @@ async function uploadToR2(buffer, key, contentType) {
       ContentType: contentType
     })
   );
-  return `${R2_PUBLIC_URL}/${encodeURIComponent(key)}`;
+  return `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(key)}`;
 }
 
-// Delete
+// Delete from R2
 async function deleteFromR2(key) {
   await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
 }
@@ -164,7 +185,7 @@ function requireAdmin(req, res, next) {
   try {
     req.admin = jwt.verify(token, ADMIN_JWT_SECRET);
     next();
-  } catch {
+  } catch (err) {
     return res.status(401).json({ success: false, error: "Invalid token" });
   }
 }
@@ -177,11 +198,13 @@ app.get("/healthz", (req, res) => res.send("ok"));
 
 // -------------------------------------------------------
 // Admin Login
+// POST /api/admin/login { email, password }
 // -------------------------------------------------------
 app.post("/api/admin/login", (req, res) => {
   const { email, password } = req.body || {};
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD)
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
     return res.status(401).json({ success: false, error: "Invalid credentials" });
+  }
 
   return res.json({
     success: true,
@@ -192,210 +215,258 @@ app.post("/api/admin/login", (req, res) => {
 
 // -------------------------------------------------------
 // Upload Vouchers
+// multipart/form-data field "vouchers" (multiple)
 // -------------------------------------------------------
-app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers"), async (req, res) => {
+app.post("/api/upload-vouchers", requireAdmin, upload.array("vouchers", 50), async (req, res) => {
   try {
+    if (!req.files || req.files.length === 0) return res.status(400).json({ success: false, error: "No files" });
+
+    const batchId = `batch-${Date.now()}`;
     const added = [];
 
     for (const file of req.files) {
       const seq = await getNextSequence("voucherSeq");
-      const ext = path.extname(file.originalname).toLowerCase();
-      const filename = `voucher_${seq}${ext}`;
-      const url = await uploadToR2(file.buffer, filename, file.mimetype);
+      const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
+      const newFilename = `voucher_${seq}${ext}`;
+      const contentType = file.mimetype || "image/jpeg";
 
-      await new Voucher({
+      // upload to R2
+      const r2url = await uploadToR2(file.buffer, newFilename, contentType);
+
+      const v = new Voucher({
         cardId: seq,
-        filename,
-        r2url: url,
+        filename: newFilename,
+        r2url,
         status: "unused",
+        batchId,
         uploadedAt: new Date()
-      }).save();
+      });
+      await v.save();
 
-      added.push({ id: seq, url });
+      added.push({ id: seq, filename: newFilename, url: r2url });
     }
 
-    res.json({ success: true, added });
+    return res.json({ success: true, added });
   } catch (err) {
-    res.status(500).json({ success: false, error: "Upload failed" });
+    console.error("Upload error:", err);
+    return res.status(500).json({ success: false, error: "Upload failed", details: err.message });
   }
 });
+
+// -------------------------------------------------------
+// GET All Vouchers (Admin)
+// -------------------------------------------------------
+app.get("/api/vouchers/all", requireAdmin, async (req, res) => {
+  try {
+    const vouchers = await Voucher.find({}).sort({ cardId: 1 }).lean();
+    return res.json({ success: true, vouchers });
+  } catch (err) {
+    console.error("Read vouchers error:", err);
+    return res.status(500).json({ success: false, error: "Failed to read vouchers" });
+  }
+});
+
+// -------------------------------------------------------
+// Delete One Voucher (Admin)
+// POST /api/vouchers/delete-one { id, filename }
+// -------------------------------------------------------
+app.post("/api/vouchers/delete-one", requireAdmin, async (req, res) => {
+  try {
+    const { id, filename } = req.body || {};
+    if (!id) return res.status(400).json({ success: false, error: "Missing id" });
+
+    if (filename) {
+      try {
+        await deleteFromR2(filename);
+      } catch (e) {
+        console.warn("R2 delete failed for", filename, e.message);
+      }
+    }
+
+    await Voucher.deleteOne({ cardId: Number(id) });
+
+    return res.json({ success: true, message: `Deleted voucher ${id}` });
+  } catch (err) {
+    console.error("Delete-one error:", err);
+    return res.status(500).json({ success: false, error: "Delete failed", details: err.message });
+  }
+});
+
 // -------------------------------------------------------
 // GET Full Purchase / Usage History (Admin)
 // -------------------------------------------------------
 app.get("/api/history", requireAdmin, async (req, res) => {
   try {
-    const history = await History.find().sort({ dateUsed: -1 }).lean();
-    return res.json({ success: true, history });
+    const hist = await History.find({}).sort({ dateUsed: -1 }).lean();
+    return res.json({ success: true, history: hist });
   } catch (err) {
-    console.error("History load error:", err);
-    return res.status(500).json({ success: false, error: "Failed to load history" });
+    console.error("Read history error:", err);
+    return res.status(500).json({ success: false, error: "Failed to read history" });
   }
 });
-// -------------------------------------------------------
-// GET All Vouchers (Admin)
-// -------------------------------------------------------
-app.get("/api/vouchers/all", requireAdmin, async (req, res) => {
-  res.json({ success: true, vouchers: await Voucher.find().sort({ cardId: 1 }) });
-});
 
 // -------------------------------------------------------
-// Delete One Voucher
+// Allocate unused vouchers helper
 // -------------------------------------------------------
-app.post("/api/vouchers/delete-one", requireAdmin, async (req, res) => {
-  const { id, filename } = req.body;
-
-  if (filename) await deleteFromR2(filename);
-
-  await Voucher.deleteOne({ cardId: id });
-
-  res.json({ success: true });
-});
-
-// -------------------------------------------------------
-// Allocate Vouchers
-// -------------------------------------------------------
-async function allocateUnused(qty, reference, phone, email) {
-  const unused = await Voucher.find({ status: "unused" })
-    .sort({ cardId: 1 })
-    .limit(qty);
-
+async function allocateUnused(qty, reference = null, phone = "unknown", email = null) {
+  const unused = await Voucher.find({ status: "unused" }).sort({ cardId: 1 }).limit(qty);
   if (unused.length < qty) return null;
 
-  const ids = unused.map((v) => v._id);
+  const ids = unused.map(u => u._id);
+  await Voucher.updateMany({ _id: { $in: ids } }, { $set: { status: "used", usedAt: new Date(), reference } });
 
-  await Voucher.updateMany(
-    { _id: { $in: ids } },
-    { $set: { status: "used", usedAt: new Date(), reference } }
-  );
+  const hist = unused.map(u => ({
+    cardId: u.cardId,
+    filename: u.filename,
+    usedBy: phone,
+    usedByEmail: email || null,
+    reference: reference || null,
+    dateUsed: new Date()
+  }));
+  await History.insertMany(hist);
 
-  await History.insertMany(
-    unused.map((v) => ({
-      cardId: v.cardId,
-      filename: v.filename,
-      usedBy: phone,
-      usedByEmail: email,
-      reference,
-      dateUsed: new Date()
-    }))
-  );
-
-  return unused.map((v) => `${R2_PUBLIC_URL}/${encodeURIComponent(v.filename)}`);
+  return unused.map(u => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(u.filename)}`);
 }
+
 // =======================================================
-// PAYSTACK — Initialize Payment
-// POST /api/pay
+// PAYSTACK — initialize payment
+// POST /api/pay { email, phone, quantity, amount }
 // =======================================================
 app.post("/api/pay", async (req, res) => {
   try {
     const { email, phone, quantity, amount } = req.body || {};
-
-    if (!email || !phone || !quantity || amount == null) {
-      return res.status(400).json({ success: false, error: "Missing fields" });
-    }
+    if (!email || !phone || !quantity || amount == null) return res.status(400).json({ success: false, error: "Missing fields" });
 
     const qty = Number(quantity);
-    if (!Number.isFinite(qty) || qty < 1) {
-      return res.status(400).json({ success: false, error: "Invalid quantity" });
-    }
+    if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ success: false, error: "Invalid quantity" });
 
-    // -------- SAFE PRICE CHECK (avoid float errors) --------
-    const expectedCents = Math.round(qty * PRICE_PER_VOUCHER * 100);   // 22.5 → 2250
+    // use cents / integer to avoid float errors
+    const expectedCents = Math.round(qty * PRICE_PER_VOUCHER * 100);
     const incomingCents = Math.round(Number(amount) * 100);
 
-    console.log("[PAY INIT] ", { email, phone, qty, amount, expectedCents, incomingCents });
-
     if (incomingCents !== expectedCents) {
-      return res.status(400).json({
-        success: false,
-        error: `Amount mismatch. Expected ${(expectedCents/100).toFixed(2)}`
-      });
+      return res.status(400).json({ success: false, error: `Amount mismatch. Expected ${(expectedCents/100).toFixed(2)}` });
     }
 
-    // -------- CHECK AVAILABLE VOUCHERS --------
     const unusedCount = await Voucher.countDocuments({ status: "unused" });
-    if (unusedCount < qty) {
-      return res.status(400).json({
-        success: false,
-        error: `Only ${unusedCount} voucher(s) available`
-      });
-    }
+    if (unusedCount < qty) return res.status(400).json({ success: false, error: `Only ${unusedCount} voucher(s) available.` });
 
-    if (!PAYSTACK_SECRET_KEY) {
-      return res.status(500).json({ success: false, error: "Paystack key not configured" });
-    }
+    if (!PAYSTACK_SECRET_KEY) return res.status(500).json({ success: false, error: "Paystack key not configured" });
 
-    // -------- INITIALIZE PAYSTACK --------
     const payload = {
       email,
-      amount: incomingCents,   // PAYSTACK USES KOBO (integer)
+      amount: incomingCents,
       metadata: { phone, quantity: qty },
-      callback_url: FRONTEND_SUCCESS_URL,
+      callback_url: FRONTEND_SUCCESS_URL
     };
 
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+    const response = await axios.post("https://api.paystack.co/transaction/initialize", payload, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" }
+    });
 
     return res.json(response.data);
-
   } catch (err) {
-    console.error("PAY INIT ERROR:", err.response?.data || err.message);
-    return res.status(500).json({
-      success: false,
-      error: "Payment initialization failed",
-      details: err.response?.data || err.message
-    });
+    console.error("Pay init error:", err.response?.data || err.message);
+    return res.status(500).json({ success: false, error: "Payment initialization failed", details: err.response?.data || err.message });
   }
 });
-// -------------------------------------------------------
-// Paystack Verify
-// -------------------------------------------------------
+
+// =======================================================
+// PAYSTACK — verify (idempotent)
+// GET /api/verify/:reference
+// =======================================================
 app.get("/api/verify/:reference", async (req, res) => {
   try {
     const ref = req.params.reference;
+    if (!ref) return res.status(400).json({ success: false, error: "Missing reference" });
+    if (!PAYSTACK_SECRET_KEY) return res.status(500).json({ success: false, error: "Paystack key not configured" });
 
-    const existing = await History.find({ reference: ref });
+    const existing = await History.find({ reference: ref }).lean();
+    if (existing.length > 0) {
+      const urls = existing.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
+      return res.json({ success: true, vouchers: urls, message: "Already verified" });
+    }
 
-    if (existing.length)
-      return res.json({
-        success: true,
-        vouchers: existing.map(
-          (h) => `${R2_PUBLIC_URL}/${encodeURIComponent(h.filename)}`
-        )
-      });
+    const verifyResp = await axios.get(`https://api.paystack.co/transaction/verify/${encodeURIComponent(ref)}`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
+    });
 
-    const verify = await axios.get(
-      `https://api.paystack.co/transaction/verify/${ref}`,
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
-    );
-
-    const data = verify.data;
-
-    if (data.data.status !== "success")
+    const payload = verifyResp.data;
+    if (!payload.status || payload.data.status !== "success") {
       return res.status(400).json({ success: false, error: "Payment not successful" });
+    }
 
-    const qty = data.data.metadata.quantity;
-    const phone = data.data.metadata.phone;
-    const email = data.data.customer.email;
+    const metadata = payload.data.metadata || {};
+    let quantity = parseInt(metadata.quantity, 10);
+    if (!quantity || isNaN(quantity)) quantity = Math.round(Number(payload.data.amount) / (PRICE_PER_VOUCHER * 100));
+    if (quantity < 1) quantity = 1;
+    if (quantity > 100) quantity = 100;
 
-    const vouchers = await allocateUnused(qty, ref, phone, email);
+    const phone = metadata.phone || payload.data.customer?.phone || "unknown";
+    const email = payload.data.customer?.email || null;
 
-    res.json({ success: true, vouchers });
-  } catch {
-    res.status(500).json({ success: false, error: "Verification failed" });
+    const assigned = await allocateUnused(quantity, ref, phone, email);
+    if (!assigned) return res.status(400).json({ success: false, error: "Payment successful but not enough vouchers left." });
+
+    return res.json({ success: true, vouchers: assigned });
+  } catch (err) {
+    console.error("Verify error:", err.response?.data || err.message);
+    return res.status(500).json({ success: false, error: "Verification failed", details: err.response?.data || err.message });
   }
 });
-// ---------------------------------------------
-// PUBLIC: retrieve by phone + paystack reference
+
+// =======================================================
+// PAYSTACK Webhook (raw body, signature check)
+// =======================================================
+app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const signature = req.headers["x-paystack-signature"];
+    const computed = crypto.createHmac("sha512", PAYSTACK_WEBHOOK_SECRET).update(req.body).digest("hex");
+    if (signature !== computed) {
+      console.warn("Webhook signature mismatch");
+      return res.status(400).send("Invalid signature");
+    }
+
+    const payload = JSON.parse(req.body.toString("utf8"));
+    const data = payload.data || payload;
+    if (!data || data.status !== "success") return res.status(200).send("ignored");
+
+    const ref = data.reference;
+    if (!ref) return res.status(400).send("no reference");
+
+    const existing = await History.find({ reference: ref }).lean();
+    if (existing.length > 0) {
+      console.log(`Webhook: reference ${ref} already processed`);
+      return res.status(200).send("already-processed");
+    }
+
+    const metadata = data.metadata || {};
+    let quantity = parseInt(metadata.quantity, 10);
+    if (!quantity || isNaN(quantity)) quantity = Math.round(Number(data.amount) / (PRICE_PER_VOUCHER * 100));
+    if (quantity < 1) quantity = 1;
+    if (quantity > 100) quantity = 100;
+
+    const phone = metadata.phone || (data.customer && data.customer.phone) || "unknown";
+    const email = data.customer?.email || null;
+
+    const allocated = await allocateUnused(quantity, ref, phone, email);
+    if (!allocated) {
+      console.error(`Webhook: Payment success but insufficient vouchers for ref ${ref}`);
+      return res.status(200).send("insufficient-vouchers");
+    }
+
+    console.log(`Webhook: allocated ${allocated.length} vouchers for ref ${ref}`);
+    return res.status(200).send("ok");
+  } catch (err) {
+    console.error("Webhook handler error:", err);
+    return res.status(500).send("error");
+  }
+});
+
+// -------------------------------------------------------
+// PUBLIC retrieve by phone + reference (dual verification)
 // GET /api/public/retrieve?phone=...&reference=...
-// ---------------------------------------------
+// -------------------------------------------------------
 app.get("/api/public/retrieve", async (req, res) => {
   try {
     const rawPhone = String(req.query.phone || "").trim();
@@ -405,24 +476,19 @@ app.get("/api/public/retrieve", async (req, res) => {
       return res.status(400).json({ success: false, error: "Missing phone or reference" });
     }
 
-    // Normalize phone: digits only; require at least 7 digits to avoid accidental matches
     const cleanedPhone = rawPhone.replace(/\D/g, "");
     if (cleanedPhone.length < 7) {
       return res.status(400).json({ success: false, error: "Invalid phone number" });
     }
 
     const ref = rawRef.trim();
-
-    // Find history entries that match reference exactly and the phone ending (keeps previous behavior)
     const allHistory = await History.find({ reference: ref }).lean();
 
-    // Filter by phone match (endsWith to support international / local formats)
     const matches = allHistory.filter(h => {
       const phoneField = (h.usedBy || "").replace(/\D/g, "");
       return phoneField.endsWith(cleanedPhone);
     });
 
-    // Create voucher URLs
     const vouchers = matches.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
 
     return res.json({ success: true, vouchers });
@@ -431,77 +497,159 @@ app.get("/api/public/retrieve", async (req, res) => {
     return res.status(500).json({ success: false, error: "Server error" });
   }
 });
+
 // -------------------------------------------------------
-// PUBLIC SEARCH (Retrieve by phone)
+// PUBLIC SEARCH (Retrieve by phone only) - kept for compatibility
+// GET /api/public/history?phone=...
 // -------------------------------------------------------
 app.get("/api/public/history", async (req, res) => {
-  const phone = (req.query.phone || "").trim();
+  try {
+    const rawPhone = (req.query.phone || "").trim();
+    if (!rawPhone) return res.status(400).json({ success: false, error: "Missing phone number" });
 
-  const matches = await History.find({
-    usedBy: { $regex: phone.replace(/\D/g, "") }
-  });
+    const cleaned = rawPhone.replace(/\D/g, "");
+    if (cleaned.length < 9) return res.json({ success: true, vouchers: [] });
 
-  res.json({
-    success: true,
-    vouchers: matches.map(
-      (h) => `${R2_PUBLIC_URL}/${encodeURIComponent(h.filename)}`
-    )
-  });
+    const history = await History.find({}).lean();
+    const matches = history.filter(h => {
+      const phoneField = (h.usedBy || "").replace(/\D/g, "");
+      return phoneField.endsWith(cleaned);
+    });
+
+    const vouchers = matches.map(h => `${R2_PUBLIC_URL.replace(/\/$/, "")}/${encodeURIComponent(h.filename)}`);
+    return res.json({ success: true, vouchers });
+  } catch (err) {
+    console.error("Public history error:", err);
+    return res.status(500).json({ success: false, error: "Server error" });
+  }
 });
 
 // =======================================================
-// DOWNLOAD PROXY (FINAL WORKING VERSION)
+// DOWNLOAD PROXY (fixes R2 CORS/download issues)
+// GET /api/download?url=...
 // =======================================================
-
 app.get("/api/download", async (req, res) => {
   try {
     const fileUrl = req.query.url;
     if (!fileUrl) return res.status(400).send("Missing file URL");
 
-    console.log("Downloading:", fileUrl);
+    console.log("[download] proxying:", fileUrl);
 
     const response = await fetch(fileUrl);
 
     if (!response.ok) {
-      console.error("Fetch failed:", response.status);
-      return res.status(502).send("Failed to fetch file");
+      console.error("[download] fetch failed:", response.status, response.statusText);
+      return res.status(502).send("Failed to fetch file from origin");
     }
 
-    const filename = decodeURIComponent(fileUrl.split("/").pop());
-    const contentType =
-      response.headers.get("content-type") || "application/octet-stream";
-
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
     res.setHeader("Content-Type", contentType);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${filename}"`
-    );
 
-    // If response.body supports .pipe() (Node stream)
-    if (typeof response.body.pipe === "function") {
-      return response.body.pipe(res);
+    const filename = decodeURIComponent((fileUrl.split("/").pop() || "voucher").replace(/["']/g, ""));
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    const body = response.body;
+    if (!body) {
+      console.error("[download] response has no body");
+      return res.status(502).send("Empty response body");
     }
 
-    // Otherwise convert WHATWG -> Node stream
-    const reader = response.body.getReader();
+    if (typeof body.pipe === "function") {
+      return body.pipe(res);
+    }
 
-    const stream = new Readable({
+    // WHATWG -> node stream conversion
+    const reader = body.getReader();
+    const nodeStream = new Readable({
       async read() {
-        const { done, value } = await reader.read();
-        if (done) return this.push(null);
-        this.push(Buffer.from(value));
+        try {
+          const { done, value } = await reader.read();
+          if (done) return this.push(null);
+          this.push(Buffer.from(value));
+        } catch (err) {
+          this.destroy(err);
+        }
       }
     });
 
-    stream.pipe(res);
+    return nodeStream.pipe(res);
   } catch (err) {
-    console.error("Download error:", err);
-    res.status(500).send("Server download error");
+    console.error("[download] proxy error:", err && err.stack ? err.stack : err);
+    try { if (!res.headersSent) res.status(500).send("Server download error"); else res.end(); } catch(e){}
   }
 });
+
 // =======================================================
-// 🔥 DELETE ALL VOUCHERS (DB + Cloudflare R2)
+// AUTO-EMAIL FEATURE
+// - Public endpoint: GET /api/auto-email/next  (rate-limited per IP)
+// - Admin endpoints:
+//     GET  /api/admin/auto-email/counter  (peek current counter)
+//     POST /api/admin/auto-email/reset    (body: { next: <number> }) to set next seq
+// Implementation: uses Counter document named "autoEmailSeq".
+// Format: auto{N}@smartwassce.com  (N is the sequence value returned by getNextSequence)
 // =======================================================
+
+const AUTO_NAME = "autoEmailSeq";
+const AUTO_DOMAIN = process.env.AUTO_EMAIL_DOMAIN || "smartwassce.com";
+
+// simple in-memory rate limiter per IP to avoid repeated auto-increment abuse
+const ipLastCall = new Map();
+const RATE_LIMIT_MS = 60 * 1000; // 60 seconds
+
+app.get("/api/auto-email/next", async (req, res) => {
+  try {
+    const ip = (req.headers["x-forwarded-for"] || req.ip || "unknown").toString();
+    const last = ipLastCall.get(ip) || 0;
+    const now = Date.now();
+    if (now - last < RATE_LIMIT_MS) {
+      const wait = Math.ceil((RATE_LIMIT_MS - (now - last)) / 1000);
+      return res.status(429).json({ success: false, error: `Rate limited. Try again in ${wait}s` });
+    }
+
+    // increment and get the next sequence number
+    const seq = await getNextSequence(AUTO_NAME); // seq will be 1,2,3...
+    ipLastCall.set(ip, now);
+
+    const email = `auto${seq}@${AUTO_DOMAIN}`;
+    return res.json({ success: true, email, seq });
+  } catch (err) {
+    console.error("/api/auto-email/next error:", err);
+    return res.status(500).json({ success: false, error: "Failed to generate auto email" });
+  }
+});
+
+// Admin: peek current counter (next value to be returned will be seq+1)
+app.get("/api/admin/auto-email/counter", requireAdmin, async (req, res) => {
+  try {
+    const seq = await peekSequence(AUTO_NAME);
+    // If seq is 0 means not used yet; show next that will be generated (seq+1)
+    return res.json({ success: true, currentSeq: seq, nextWouldBe: seq + 1 });
+  } catch (err) {
+    console.error("admin/auto-email/counter error:", err);
+    return res.status(500).json({ success: false, error: "Failed to read counter" });
+  }
+});
+
+// Admin: reset or set next sequence number
+app.post("/api/admin/auto-email/reset", requireAdmin, async (req, res) => {
+  try {
+    const next = Number(req.body?.next);
+    if (!Number.isFinite(next) || next < 1) {
+      return res.status(400).json({ success: false, error: "Invalid next number (must be >= 1)" });
+    }
+    // We store seq = next - 1 because getNextSequence increments before returning
+    const storeValue = Math.max(0, next - 1);
+    await setSequence(AUTO_NAME, storeValue);
+    return res.json({ success: true, message: `Auto-email counter set. Next will be ${next}` });
+  } catch (err) {
+    console.error("admin/auto-email/reset error:", err);
+    return res.status(500).json({ success: false, error: "Failed to set counter" });
+  }
+});
+
+// -------------------------------------------------------
+// DELETE ALL VOUCHERS (Admin)
+// -------------------------------------------------------
 app.delete("/api/vouchers/delete-all", requireAdmin, async (req, res) => {
   try {
     const vouchers = await Voucher.find({});
@@ -524,9 +672,9 @@ app.delete("/api/vouchers/delete-all", requireAdmin, async (req, res) => {
   }
 });
 
-// =======================================================
-// 🔥 DELETE ALL HISTORY
-// =======================================================
+// -------------------------------------------------------
+// DELETE ALL HISTORY (Admin)
+// -------------------------------------------------------
 app.delete("/api/history/delete-all", requireAdmin, async (req, res) => {
   try {
     await History.deleteMany({});
@@ -537,9 +685,8 @@ app.delete("/api/history/delete-all", requireAdmin, async (req, res) => {
   }
 });
 
-// =======================================================
-// 🔥 EXPORT ALL VOUCHERS (for Excel)
-// =======================================================
+// -------------------------------------------------------
+// Export endpoints (Admin)
 app.get("/api/vouchers/export", requireAdmin, async (req, res) => {
   try {
     const vouchers = await Voucher.find({}).lean();
@@ -548,10 +695,6 @@ app.get("/api/vouchers/export", requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-
-// =======================================================
-// 🔥 EXPORT USED VOUCHERS
-// =======================================================
 app.get("/api/vouchers/export-used", requireAdmin, async (req, res) => {
   try {
     const vouchers = await Voucher.find({ status: "used" }).lean();
@@ -560,10 +703,6 @@ app.get("/api/vouchers/export-used", requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-
-// =======================================================
-// 🔥 EXPORT UNUSED VOUCHERS
-// =======================================================
 app.get("/api/vouchers/export-unused", requireAdmin, async (req, res) => {
   try {
     const vouchers = await Voucher.find({ status: "unused" }).lean();
@@ -572,10 +711,6 @@ app.get("/api/vouchers/export-unused", requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-
-// =======================================================
-// 🔥 EXPORT FULL HISTORY
-// =======================================================
 app.get("/api/history/export", requireAdmin, async (req, res) => {
   try {
     const history = await History.find({}).lean();
@@ -584,61 +719,41 @@ app.get("/api/history/export", requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-// =======================================================
-// ⚠ LOW-STOCK ALERT
-// =======================================================
+
+// -------------------------------------------------------
+// Admin low-stock & revenue endpoints
 app.get("/api/admin/low-stock", requireAdmin, async (req, res) => {
   try {
     const unused = await Voucher.countDocuments({ status: "unused" });
     const low = unused < 5;
-
-    return res.json({
-      success: true,
-      unused,
-      low,
-      threshold: 50
-    });
-
+    return res.json({ success: true, unused, low, threshold: 50 });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// =======================================================
-// 📊 REVENUE ANALYTICS
-// =======================================================
 app.get("/api/admin/revenue-stats", requireAdmin, async (req, res) => {
   try {
     const PRICE = PRICE_PER_VOUCHER || 22.5;
-
     const history = await History.find({}).lean();
 
-    let totalVouchers = history.length;
-    let totalRevenue = totalVouchers * PRICE;
+    const totalVouchers = history.length;
+    const totalRevenue = totalVouchers * PRICE;
 
-    // Group by day
-    let daily = {};
+    const daily = {};
     history.forEach(h => {
       const day = new Date(h.dateUsed).toISOString().split("T")[0];
       if (!daily[day]) daily[day] = 0;
       daily[day] += PRICE;
     });
 
-    return res.json({
-      success: true,
-      totalRevenue,
-      totalVouchers,
-      PRICE,
-      daily
-    });
-
+    return res.json({ success: true, totalRevenue, totalVouchers, PRICE, daily });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
 // -------------------------------------------------------
 // START SERVER
 // -------------------------------------------------------
-app.listen(PORT, () =>
-  console.log(`🚀 Server running at http://localhost:${PORT}`)
-);
+app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
