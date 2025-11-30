@@ -37,7 +37,7 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL || `${BASE_URL}/success.html`;
 
 // price can be overridden via env; default to 20.5 as you requested
-const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 20.5);
+const PRICE_PER_VOUCHER = Number(process.env.PRICE_PER_VOUCHER || 25.5);
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@gmail.com";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
